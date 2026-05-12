@@ -26,7 +26,7 @@ An AI-powered movie recommendation agent built with Claude API. Takes user prefe
 
 ### Seminar 6 — AutoHunt Car Selling Website (MCP + Agents)
 
-A full-stack car marketplace website built using **Figma MCP** for design reference and **parallel Claude subagents** for frontend/backend generation.
+A full-stack car marketplace website built using **Figma MCP** for design reference and **parallel Claude subagents** for frontend/backend generation. Agent templates from [aitmpl.com](https://www.aitmpl.com/) were used.
 
 **Stack:**
 - Frontend: React 18 + TypeScript + Vite + Tailwind CSS
