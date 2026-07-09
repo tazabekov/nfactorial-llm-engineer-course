@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "weather-agent": {
+      "command": "/Users/gizzat/code/nfactorial-llm-engineer-course/seminar/15-mcp-creation/.venv/bin/python",
+      "args": [
+        "/Users/gizzat/code/nfactorial-llm-engineer-course/seminar/15-mcp-creation/weather_server.py"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    }
+  }
+}
