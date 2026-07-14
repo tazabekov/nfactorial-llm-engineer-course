@@ -68,6 +68,47 @@ function updateFinalreportAvailability() {
   });
 });
 
+async function parseJsonResponse(res) {
+  const text = await res.text();
+
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`Сервер вернул неожиданный ответ (${res.status}). Попробуйте ещё раз.`);
+  }
+
+  if (!res.ok) {
+    throw new Error(data.detail || `Ошибка сервера (${res.status}).`);
+  }
+  return data;
+}
+
+const MAX_IMAGE_DIMENSION = 1600;
+const DOWNSCALE_THRESHOLD_BYTES = 1.5 * 1024 * 1024;
+
+async function downscaleImage(file) {
+  if (file.size < DOWNSCALE_THRESHOLD_BYTES) return file;
+
+  try {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(bitmap.width, bitmap.height));
+    if (scale >= 1) return file;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+    if (!blob) return file;
+
+    return new File([blob], file.name.replace(/\.\w+$/, "") + ".jpg", { type: "image/jpeg" });
+  } catch {
+    return file; // fall back to the original file if downscaling fails for any reason
+  }
+}
+
 function scoreColor(value) {
   if (value <= 4) return "var(--bad)";
   if (value <= 7) return "var(--mid)";
@@ -79,13 +120,14 @@ function showError(message) {
   errorMsg.hidden = !message;
 }
 
-function setFile(file) {
+async function setFile(file) {
   if (!file || !file.type.startsWith("image/")) {
     showError("Пожалуйста, выберите файл изображения.");
     return;
   }
-  selectedFile = file;
   showError("");
+
+  selectedFile = await downscaleImage(file);
 
   const reader = new FileReader();
   reader.onload = (e) => {
@@ -93,7 +135,7 @@ function setFile(file) {
     preview.hidden = false;
     dropzone.querySelector(".dropzone__prompt").style.display = "none";
   };
-  reader.readAsDataURL(file);
+  reader.readAsDataURL(selectedFile);
 
   analyzeBtn.disabled = false;
   stageBtn.disabled = false;
@@ -175,11 +217,7 @@ analyzeBtn.addEventListener("click", async () => {
 
   try {
     const res = await fetch("/analyze", { method: "POST", body: formData });
-    const data = await res.json();
-
-    if (!res.ok) {
-      throw new Error(data.detail || "Не удалось проанализировать фотографию.");
-    }
+    const data = await parseJsonResponse(res);
 
     renderReport(data);
   } catch (err) {
@@ -217,11 +255,7 @@ stageBtn.addEventListener("click", async () => {
 
   try {
     const res = await fetch("/stage", { method: "POST", body: formData });
-    const data = await res.json();
-
-    if (!res.ok) {
-      throw new Error(data.detail || "Не удалось преобразить фотографию.");
-    }
+    const data = await parseJsonResponse(res);
 
     compareBefore.src = preview.src;
     compareAfter.src = `data:${data.mime_type};base64,${data.image_base64}`;
@@ -273,11 +307,7 @@ finalreportBtn.addEventListener("click", async () => {
         before_modernity: beforeModernity,
       }),
     });
-    const data = await res.json();
-
-    if (!res.ok) {
-      throw new Error(data.detail || "Не удалось рассчитать стоимость обновления.");
-    }
+    const data = await parseJsonResponse(res);
 
     finalreportText.textContent = data.report_text;
     receiptItem.textContent = data.matched_furniture.model_name;
