@@ -116,11 +116,17 @@
         <span class="loading__label">Дизайнер преображает интерьер&hellip;</span>
       </div>
 
-      <div id="staging-compare" class="compare" hidden>
-        <figure class="compare__figure">
-          <figcaption>После</figcaption>
-          <img id="compare-after" alt="Фото после">
-        </figure>
+      <div id="staging-compare" class="compare-slider" hidden>
+        <div class="compare-slider__frame" id="compare-frame">
+          <img id="compare-after" class="compare-slider__img" alt="Фото после">
+          <img id="compare-before" class="compare-slider__img compare-slider__img--before" alt="Фото до">
+          <div class="compare-slider__handle" id="compare-handle" aria-hidden="true">
+            <span class="compare-slider__handle-grip">&#8596;</span>
+          </div>
+          <span class="compare-slider__label compare-slider__label--before">До</span>
+          <span class="compare-slider__label compare-slider__label--after">После</span>
+          <input type="range" id="compare-range" class="compare-slider__range" min="0" max="100" value="50" aria-label="Сравнение до/после">
+        </div>
       </div>
     </div>
   </div>

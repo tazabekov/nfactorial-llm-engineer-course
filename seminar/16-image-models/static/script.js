@@ -30,7 +30,14 @@ const stageErrorMsg = document.getElementById("stage-error-msg");
 const stagingPlaceholder = document.getElementById("staging-placeholder");
 const stagingLoading = document.getElementById("staging-loading");
 const stagingCompare = document.getElementById("staging-compare");
+const compareFrame = document.getElementById("compare-frame");
+const compareBefore = document.getElementById("compare-before");
 const compareAfter = document.getElementById("compare-after");
+const compareRange = document.getElementById("compare-range");
+
+compareRange.addEventListener("input", () => {
+  compareFrame.style.setProperty("--split", `${compareRange.value}%`);
+});
 
 const finalreportBtn = document.getElementById("finalreport-btn");
 const finalreportErrorMsg = document.getElementById("finalreport-error-msg");
@@ -218,7 +225,10 @@ stageBtn.addEventListener("click", async () => {
       throw new Error(data.detail || "Не удалось преобразить фотографию.");
     }
 
+    compareBefore.src = preview.src;
     compareAfter.src = `data:${data.mime_type};base64,${data.image_base64}`;
+    compareRange.value = 50;
+    compareFrame.style.setProperty("--split", "50%");
 
     stagingLoading.hidden = true;
     stagingCompare.hidden = false;

@@ -470,32 +470,118 @@ body {
   min-height: 16rem;
 }
 
-.compare {
-  display: grid;
-  grid-template-columns: 1fr;
-  height: 100%;
-}
-
-.compare__figure {
-  margin: 0;
+.compare-slider {
   display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
+  height: 100%;
+  align-items: center;
 }
 
-.compare__figure figcaption {
-  text-align: center;
-  font-family: "Fraunces", serif;
-  font-style: italic;
-  font-size: 0.85rem;
-  color: var(--brass-dark);
-}
-
-.compare__figure img {
+.compare-slider__frame {
+  position: relative;
   width: 100%;
   border-radius: 3px;
+  overflow: hidden;
   border: 1px solid var(--rule);
   box-shadow: var(--shadow);
+  user-select: none;
+  --split: 50%;
+}
+
+.compare-slider__img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.compare-slider__img--before {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  clip-path: inset(0 calc(100% - var(--split)) 0 0);
+}
+
+.compare-slider__handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--split);
+  width: 2px;
+  background: var(--paper);
+  transform: translateX(-50%);
+  pointer-events: none;
+  box-shadow: 0 0 0 1px var(--brass-dark);
+}
+
+.compare-slider__handle-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2.3rem;
+  height: 2.3rem;
+  border-radius: 50%;
+  background: var(--brass-dark);
+  color: var(--paper);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.05rem;
+  box-shadow: var(--shadow);
+}
+
+.compare-slider__label {
+  position: absolute;
+  top: 0.6rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(35, 40, 31, 0.65);
+  color: var(--paper);
+  font-family: "Fraunces", serif;
+  font-style: italic;
+  font-size: 0.75rem;
+  pointer-events: none;
+}
+
+.compare-slider__label--before {
+  left: 0.6rem;
+}
+
+.compare-slider__label--after {
+  right: 0.6rem;
+}
+
+.compare-slider__range {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: ew-resize;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+.compare-slider__range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 2.3rem;
+  height: 100%;
+  background: transparent;
+}
+
+.compare-slider__range::-moz-range-thumb {
+  width: 2.3rem;
+  height: 100%;
+  background: transparent;
+  border: none;
+}
+
+.compare-slider__range::-moz-range-track {
+  background: transparent;
+  border: none;
 }
 
 .panel--finalreport {
