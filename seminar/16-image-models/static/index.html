@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI-Оценщик Недвижимости</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,500&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="grain"></div>
+
+<header class="masthead">
+  <div class="masthead__mark">АО</div>
+  <div class="masthead__text">
+    <h1>AI-Оценщик Недвижимости</h1>
+    <p>Экспертиза состояния помещения по фотографии &mdash; загрузите снимок, получите отчёт оценщика и переоформите интерьер</p>
+  </div>
+</header>
+
+<main class="dossier">
+
+  <section class="panel panel--upload">
+    <h2 class="panel__label">01 &mdash; Фотография</h2>
+
+    <label id="dropzone" class="dropzone" for="file-input">
+      <div class="dropzone__prompt">
+        <span class="dropzone__icon">&#128247;</span>
+        <span class="dropzone__text">Перетащите фото сюда<br>или нажмите, чтобы выбрать</span>
+      </div>
+      <img id="preview" class="dropzone__preview" alt="Предпросмотр фотографии" hidden>
+    </label>
+    <input id="file-input" type="file" accept="image/*" hidden>
+
+    <button id="analyze-btn" class="btn" disabled>Оценить квартиру</button>
+    <p id="error-msg" class="error-msg" hidden></p>
+  </section>
+
+  <section class="panel panel--report">
+    <h2 class="panel__label">02 &mdash; Отчёт оценщика</h2>
+
+    <div id="placeholder" class="placeholder">
+      <p>Отчёт появится здесь после загрузки и анализа фотографии.</p>
+    </div>
+
+    <div id="loading" class="loading" hidden>
+      <span class="loading__dot"></span>
+      <span class="loading__dot"></span>
+      <span class="loading__dot"></span>
+      <span class="loading__label">Оценщик изучает фотографию&hellip;</span>
+    </div>
+
+    <div id="report" class="report" hidden>
+      <div class="report__seal">
+        <span id="overall-score" class="report__seal-number">&mdash;</span>
+        <span class="report__seal-label">общий балл</span>
+      </div>
+
+      <ul class="scorecard" id="scorecard"></ul>
+
+      <blockquote id="summary" class="verdict"></blockquote>
+    </div>
+  </section>
+
+</main>
+
+<section class="panel panel--staging">
+  <h2 class="panel__label">03 &mdash; Виртуальный стейджинг</h2>
+
+  <div class="staging">
+    <div class="staging__controls">
+      <label class="field">
+        <span class="field__label">Что изменить на фото</span>
+        <textarea id="stage-prompt" class="field__textarea" rows="3">Замени старый диван на современный светло-серый диван в скандинавском стиле</textarea>
+      </label>
+
+      <div class="params">
+        <label class="param">
+          <span class="param__label">Temperature <output id="temperature-val" for="temperature">1.0</output></span>
+          <input type="range" id="temperature" min="0" max="2" step="0.1" value="1.0">
+          <span class="param__hint">Творческая свобода модели: выше — смелее и неожиданнее результат, ниже — предсказуемее.</span>
+        </label>
+        <label class="param">
+          <span class="param__label">Top-p <output id="top-p-val" for="top-p">0.95</output></span>
+          <input type="range" id="top-p" min="0" max="1" step="0.05" value="0.95">
+          <span class="param__hint">Nucleus sampling: модель выбирает только из самых вероятных вариантов. Ниже — консервативнее, выше — разнообразнее.</span>
+        </label>
+        <label class="param">
+          <span class="param__label">Top-k <output id="top-k-val" for="top-k">40</output></span>
+          <input type="range" id="top-k" min="1" max="64" step="1" value="40">
+          <span class="param__hint">Сколько наиболее вероятных вариантов модель рассматривает на каждом шаге генерации.</span>
+        </label>
+        <label class="param param--seed">
+          <span class="param__label">Seed (необязательно)</span>
+          <input type="number" id="seed" placeholder="случайно">
+          <span class="param__hint">Фиксирует случайность: тот же seed + те же параметры = воспроизводимый результат. Пусто — каждый раз случайно.</span>
+        </label>
+      </div>
+
+      <button id="stage-btn" class="btn" disabled>Преобразить квартиру</button>
+      <p id="stage-error-msg" class="error-msg" hidden></p>
+    </div>
+
+    <div class="staging__result">
+      <div id="staging-placeholder" class="placeholder">
+        <p>Загрузите фото в шаге 01, опишите изменения и нажмите «Преобразить квартиру».</p>
+      </div>
+
+      <div id="staging-loading" class="loading" hidden>
+        <span class="loading__dot"></span>
+        <span class="loading__dot"></span>
+        <span class="loading__dot"></span>
+        <span class="loading__label">Дизайнер преображает интерьер&hellip;</span>
+      </div>
+
+      <div id="staging-compare" class="compare" hidden>
+        <figure class="compare__figure">
+          <figcaption>После</figcaption>
+          <img id="compare-after" alt="Фото после">
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel panel--finalreport">
+  <h2 class="panel__label">04 &mdash; Итоговый отчёт</h2>
+
+  <button id="finalreport-btn" class="btn" disabled>Рассчитать стоимость обновления</button>
+  <p id="finalreport-error-msg" class="error-msg" hidden></p>
+
+  <div id="finalreport-placeholder" class="placeholder">
+    <p>Сначала получите отчёт оценщика (шаг 02) и преобразите квартиру (шаг 03), затем нажмите «Рассчитать стоимость обновления».</p>
+  </div>
+
+  <div id="finalreport-loading" class="loading" hidden>
+    <span class="loading__dot"></span>
+    <span class="loading__dot"></span>
+    <span class="loading__dot"></span>
+    <span class="loading__label">Сверяем мебель с каталогом&hellip;</span>
+  </div>
+
+  <div id="finalreport" class="finalreport" hidden>
+    <blockquote id="finalreport-text" class="verdict"></blockquote>
+
+    <div class="receipt">
+      <div class="receipt__row">
+        <span class="receipt__label">Позиция</span>
+        <span id="receipt-item" class="receipt__value"></span>
+      </div>
+      <div class="receipt__row">
+        <span class="receipt__label">Стиль / цвет</span>
+        <span id="receipt-style" class="receipt__value"></span>
+      </div>
+      <div class="receipt__row receipt__row--total">
+        <span class="receipt__label">Стоимость обновления</span>
+        <span id="receipt-price" class="receipt__value"></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="colophon">Модуль 3 &middot; Lecture 16 - Image модели</footer>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
