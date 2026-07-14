@@ -99,8 +99,6 @@ function setFile(file) {
   stageBtn.disabled = false;
 }
 
-dropzone.addEventListener("click", () => fileInput.click());
-
 fileInput.addEventListener("change", () => {
   if (fileInput.files[0]) setFile(fileInput.files[0]);
 });
