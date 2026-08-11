@@ -326,6 +326,75 @@ def generator(state: AgentState) -> dict:
                                            f"найдено {len(facts)} слотов")]}
 
 
+def rag_upsert(state: AgentState) -> dict:
+    """Детерминированный узел: мержит факты в векторную БД, LLM не участвует."""
+    facts = state.get("facts") or {}
+    if not facts:
+        print("  💾 нечего сохранять")
+        return {}
+    dossier = upsert_profile.invoke({"name": state["target_person"], "facts": facts})
+    print(f"  💾 записано слотов: {len(facts)} → всего в досье: {len(dossier)}")
+    return {}
+
+
+REFLECTOR_SYSTEM = """Ты критик OSINT-исследования. Оцени собранное досье.
+
+Верни:
+- missing: список слотов, которые пусты ИЛИ вызывают сомнение (похоже на однофамильца,
+  факт не подтверждён источником). Допустимые значения: {slots}
+- insights: один конкретный урок для следующей попытки поиска. Не общие слова, а
+  что именно пошло не так. Например: «Искали без указания специальности, и Jina принёс
+  статью про строителя вместо AI-инженера»."""
+
+
+def reflector(state: AgentState) -> dict:
+    dossier = query_profile.invoke({"name": state["target_person"]})
+    review = ChatOpenAI(model=MODEL).with_structured_output(Reflection).invoke([
+        SystemMessage(content=REFLECTOR_SYSTEM.format(slots=", ".join(SLOTS))),
+        HumanMessage(content=f"Цель: {state['target_person']}\n\n"
+                             f"Досье:\n{format_dossier(dossier)}"),
+    ])
+    missing = [s for s in review.missing if s in SLOTS]
+    done = not missing
+    status = "досье полное" if done else f"не хватает: {', '.join(missing)}"
+    print(f"  🧐 Reflector: {status}\n     insight: {review.insights}")
+    return {"insights": review.insights, "missing": missing, "done": done}
+
+
+CURATOR_SYSTEM = """Ты куратор контекста агента. У агента есть плейбук — список правил поиска.
+
+ТЕКУЩИЙ ПЛЕЙБУК:
+{playbook}
+
+Внеси ТОЧЕЧНЫЕ правки, опираясь на урок Рефлектора:
+- add: 1-2 новых конкретных правила. Правило должно менять поведение поиска
+  (что добавить в запрос, где искать, что перепроверить), а не описывать цель.
+- remove: номера правил, которые доказали свою бесполезность. Нумерация с 1.
+  Правила 1 и 2 базовые, их удалять нельзя.
+
+Не переписывай плейбук целиком."""
+
+
+def curator(state: AgentState) -> dict:
+    ops = ChatOpenAI(model=MODEL).with_structured_output(PlaybookOps).invoke([
+        SystemMessage(content=CURATOR_SYSTEM.format(
+            playbook=format_playbook(state["playbook"]))),
+        HumanMessage(content=f"Урок Рефлектора: {state['insights']}\n"
+                             f"Не хватает слотов: {', '.join(state['missing'])}"),
+    ])
+    playbook, added, removed, evicted = apply_playbook_ops(
+        state["playbook"], ops.add, ops.remove)
+    for rule in removed:
+        print(f"  ✍  - {rule}")
+    for rule in added:
+        print(f"  ✍  + {rule}")
+    for rule in evicted:
+        print(f"  ⤵  вытеснено лимитом: {rule}")
+    print(f"\n  📋 ПЛЕЙБУК после итерации {state['iterations']}:\n"
+          f"{format_playbook(playbook)}\n")
+    return {"playbook": playbook}
+
+
 SELFTESTS = []
 
 
@@ -529,6 +598,24 @@ def test_format_playbook():
     out = format_playbook(["первое", "второе"])
     assert "1. первое" in out and "2. второе" in out
     assert format_playbook([]).strip() == "(пусто)"
+
+
+@selftest
+def test_rag_upsert_node():
+    import tempfile
+    global CHROMA_DIR, _STORE
+    prev_dir, prev_store = CHROMA_DIR, _STORE
+    try:
+        CHROMA_DIR = tempfile.mkdtemp(prefix="chroma_node_")
+        _STORE = None
+        state = {"target_person": "Узел Проверкин",
+                 "facts": {"role_title": "инженер", "location": "Алматы"}}
+        out = rag_upsert(state)
+        assert out == {}, "узел пишет в Chroma, а не в state"
+        stored = query_profile.invoke({"name": "Узел Проверкин"})
+        assert stored["role_title"] == "инженер"
+    finally:
+        CHROMA_DIR, _STORE = prev_dir, prev_store
 
 
 if __name__ == "__main__":
