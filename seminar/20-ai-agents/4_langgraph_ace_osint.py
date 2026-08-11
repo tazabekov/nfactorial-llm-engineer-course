@@ -10,11 +10,17 @@ Showcase 4 — LangGraph + ACE: Self-Evolving OSINT Agent
 import json
 import os
 import sys
+from typing import Annotated, Dict, List, Literal, TypedDict
+
 import requests
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
 load_dotenv()
 MODEL = os.getenv("GENERATOR_MODEL", "gpt-5.6-terra")
@@ -217,6 +223,105 @@ def jina_reader(url: str) -> str:
         return f"[ошибка скрапинга] {url} недоступен: {e}"
 
 
+class AgentState(TypedDict):
+    target_person: str                        # кого ищем (ФИО + контекст)
+    playbook: List[str]                       # ключевая фишка ACE: правила поиска
+    insights: str                             # выводы Reflector
+    messages: Annotated[list, add_messages]   # история вызовов тулов
+    iterations: int                           # счётчик циклов
+    facts: Dict[str, str]                     # выход Generator → вход RAG_Upsert
+    missing: List[str]                        # незакрытые слоты → вход Curator
+    done: bool                                # решение для условного ребра
+
+
+class Facts(BaseModel):
+    """Факты, извлечённые за одну итерацию. Пустая строка = не нашли."""
+    role_title: str = Field("", description="должность или род занятий")
+    organization: str = Field("", description="компания, школа или проект")
+    education: str = Field("", description="университет, степень")
+    notable_work: str = Field("", description="проекты, публикации, репозитории")
+    online_presence: str = Field("", description="соцсети, личный сайт, профили")
+    location: str = Field("", description="город или страна")
+
+
+class Reflection(BaseModel):
+    missing: List[str] = Field(default_factory=list,
+                               description="слоты досье, которые всё ещё пусты или сомнительны")
+    insights: str = Field("", description="конкретный урок: что пошло не так в поиске")
+
+
+class PlaybookOps(BaseModel):
+    add: List[str] = Field(default_factory=list, description="новые правила поиска")
+    remove: List[int] = Field(default_factory=list,
+                              description="номера правил для удаления, нумерация с 1")
+
+
+TOOLS = {"exa_search": exa_search, "jina_reader": jina_reader}
+
+
+def format_playbook(playbook: List[str]) -> str:
+    if not playbook:
+        return "(пусто)"
+    return "\n".join(f"{i}. {rule}" for i, rule in enumerate(playbook, 1))
+
+
+def format_dossier(dossier: Dict[str, str]) -> str:
+    lines = [f"  - {SLOT_RU[s]}: {dossier.get(s) or '—'}" for s in SLOTS]
+    return "\n".join(lines)
+
+
+GENERATOR_SYSTEM = """Ты OSINT-исследователь. Твоя задача — собрать досье на человека.
+
+ПЛЕЙБУК (правила, выученные на прошлых итерациях, соблюдай их):
+{playbook}
+
+УЖЕ ИЗВЕСТНО:
+{dossier}
+
+НУЖНО НАЙТИ В ЭТОЙ ИТЕРАЦИИ: {missing}
+
+Используй exa_search, чтобы найти страницы, и jina_reader, чтобы прочитать самые
+перспективные из них. Сначала ищи, потом читай — не выдумывай URL.
+Не более {max_calls} вызовов инструментов. Затем верни найденные факты.
+Если факт не подтверждён прочитанной страницей — оставь поле пустым."""
+
+
+def generator(state: AgentState) -> dict:
+    dossier = query_profile.invoke({"name": state["target_person"]})
+    missing = state.get("missing") or SLOTS
+    system = GENERATOR_SYSTEM.format(
+        playbook=format_playbook(state["playbook"]),
+        dossier=format_dossier(dossier),
+        missing=", ".join(SLOT_RU[s] for s in missing),
+        max_calls=MAX_TOOL_CALLS,
+    )
+    llm = ChatOpenAI(model=MODEL, reasoning_effort="none").bind_tools(list(TOOLS.values()))
+    convo = [SystemMessage(content=system),
+             HumanMessage(content=f"Цель: {state['target_person']}")]
+
+    calls_made = 0
+    while calls_made < MAX_TOOL_CALLS:
+        ai = llm.invoke(convo)
+        convo.append(ai)
+        if not ai.tool_calls:
+            break
+        for call in ai.tool_calls:
+            print(f"  🛠  {call['name']}({json.dumps(call['args'], ensure_ascii=False)[:120]})")
+            convo.append(ToolMessage(content=TOOLS[call["name"]].invoke(call["args"]),
+                                     tool_call_id=call["id"]))
+            calls_made += 1
+
+    extracted = ChatOpenAI(model=MODEL).with_structured_output(Facts).invoke(
+        convo + [HumanMessage(content="Верни извлечённые факты по слотам досье.")]
+    )
+    facts = {k: v for k, v in extracted.model_dump().items() if v.strip()}
+    print(f"  📦 извлечено слотов: {len(facts)}")
+    return {"facts": facts,
+            "iterations": state["iterations"] + 1,
+            "messages": [AIMessage(content=f"Итерация {state['iterations'] + 1}: "
+                                           f"найдено {len(facts)} слотов")]}
+
+
 SELFTESTS = []
 
 
@@ -399,6 +504,27 @@ def test_exa_error_is_visible():
     finally:
         requests.post = real_post
         OFFLINE = prev_offline
+
+
+@selftest
+def test_state_and_models():
+    assert set(AgentState.__annotations__) == {
+        "target_person", "playbook", "insights", "messages",
+        "iterations", "facts", "missing", "done",
+    }
+    # Facts покрывает ровно слоты досье
+    assert set(Facts.model_fields) == set(SLOTS)
+    # необязательные поля: модель может вернуть частичный результат
+    assert Facts().model_dump() == {s: "" for s in SLOTS}
+    assert set(Reflection.model_fields) == {"missing", "insights"}
+    assert set(PlaybookOps.model_fields) == {"add", "remove"}
+
+
+@selftest
+def test_format_playbook():
+    out = format_playbook(["первое", "второе"])
+    assert "1. первое" in out and "2. второе" in out
+    assert format_playbook([]).strip() == "(пусто)"
 
 
 if __name__ == "__main__":
