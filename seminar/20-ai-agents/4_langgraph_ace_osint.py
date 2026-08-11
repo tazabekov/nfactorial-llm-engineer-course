@@ -7,8 +7,10 @@ Showcase 4 — LangGraph + ACE: Self-Evolving OSINT Agent
 Граф:  START → generator → rag_upsert → reflector ─(done|limit)→ END
                    ▲                          └→ curator ─┘
 """
+import json
 import os
 import sys
+import requests
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from langchain_chroma import Chroma
@@ -143,6 +145,78 @@ def upsert_profile(name: str, facts: dict) -> dict:
     return {**current, **merged}
 
 
+OFFLINE_FIXTURES = {
+    "search": [
+        {"title": "Арман Сулейменов — nFactorial School",
+         "url": "https://example.org/armanulean",
+         "text": "Основатель школы программирования nFactorial в Алматы."},
+        {"title": "Однофамилец: Арман Сулейменов, строитель",
+         "url": "https://example.org/wrong-person",
+         "text": "Прораб строительной компании в Астане. Не имеет отношения к IT."},
+    ],
+    "pages": {
+        "https://example.org/armanulean": (
+            "# Арман Сулейменов\n\n"
+            "Основатель школы программирования nFactorial (Алматы, Казахстан). "
+            "Выпускник Purdue University, финалист ACM ICPC. "
+            "Основал Zero To One Labs. GitHub: github.com/example.\n"
+        ),
+        "https://example.org/wrong-person": (
+            "# Арман Сулейменов\n\nПрораб строительной компании в Астане.\n"
+        ),
+    },
+}
+
+
+def require_keys() -> None:
+    """Падаем сразу, а не через три LLM-вызова."""
+    missing = [k for k in ("OPENAI_API_KEY", "EXA_API_KEY") if not os.getenv(k)]
+    if missing:
+        sys.exit(f"❌ Нет переменных окружения: {', '.join(missing)}. "
+                 f"Добавь их в .env в корне репозитория или запусти с --offline.")
+
+
+@tool
+def exa_search(query: str, num_results: int = 5) -> str:
+    """Семантический веб-поиск через Exa AI. Возвращает JSON со списком title/url/text."""
+    if OFFLINE:
+        return json.dumps(OFFLINE_FIXTURES["search"][:num_results], ensure_ascii=False)
+    try:
+        r = requests.post(
+            "https://api.exa.ai/search",
+            headers={"x-api-key": os.getenv("EXA_API_KEY", "")},
+            json={"query": query, "numResults": num_results,
+                  "contents": {"text": {"maxCharacters": 400}}},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": f"Exa вернул {r.status_code}: {r.text[:200]}"},
+                              ensure_ascii=False)
+        results = [{"title": x.get("title"), "url": x.get("url"),
+                    "text": (x.get("text") or "")[:400]}
+                   for x in r.json().get("results", [])]
+        return json.dumps(results, ensure_ascii=False)
+    except requests.RequestException as e:
+        return json.dumps({"error": f"Exa недоступен: {e}"}, ensure_ascii=False)
+
+
+@tool
+def jina_reader(url: str) -> str:
+    """Скрапит страницу через Jina Reader и возвращает чистый Markdown."""
+    if OFFLINE:
+        return OFFLINE_FIXTURES["pages"].get(url, f"OFFLINE: нет фикстуры для {url}")
+    headers = {"Accept": "text/markdown"}
+    if os.getenv("JINA_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.getenv('JINA_API_KEY')}"
+    try:
+        r = requests.get(f"https://r.jina.ai/{url}", headers=headers, timeout=25)
+        if r.status_code != 200:
+            return f"[ошибка скрапинга] Jina вернул {r.status_code} для {url}"
+        return r.text[:4000]
+    except requests.RequestException as e:
+        return f"[ошибка скрапинга] {url} недоступен: {e}"
+
+
 SELFTESTS = []
 
 
@@ -270,6 +344,61 @@ def test_profile_roundtrip():
         assert "хобби" not in query_profile.invoke({"name": "Тест Тестов"})
     finally:
         CHROMA_DIR, _STORE = prev_dir, prev_store
+
+
+@selftest
+def test_tools_offline():
+    import json as _json
+    global OFFLINE
+    prev = OFFLINE
+    try:
+        OFFLINE = True
+        results = _json.loads(exa_search.invoke({"query": "кто угодно"}))
+        assert isinstance(results, list) and results, "офлайн-фикстура должна вернуть результаты"
+        assert {"title", "url", "text"} <= set(results[0])
+
+        page = jina_reader.invoke({"url": results[0]["url"]})
+        assert isinstance(page, str) and len(page) > 50
+
+        # неизвестный URL не падает, а сообщает об этом
+        miss = jina_reader.invoke({"url": "https://example.com/нет-такого"})
+        assert "OFFLINE" in miss
+    finally:
+        OFFLINE = prev
+
+
+@selftest
+def test_exa_error_is_visible():
+    """Ошибка Exa должна дойти до LLM текстом, а не превратиться в пустой список.
+
+    Сеть не трогаем: подменяем requests.post, чтобы проверить обе ветки отказа.
+    """
+    import json as _json
+    global OFFLINE
+
+    class _Unauthorized:
+        status_code = 401
+        text = "unauthorized"
+
+    prev_offline, real_post = OFFLINE, requests.post
+    try:
+        OFFLINE = False
+
+        requests.post = lambda *a, **kw: _Unauthorized()
+        payload = _json.loads(exa_search.invoke({"query": "проверка кода ответа"}))
+        assert isinstance(payload, dict), "ошибка обязана быть объектом, а не списком"
+        assert "401" in payload["error"]
+
+        def _boom(*a, **kw):
+            raise requests.RequestException("сеть недоступна")
+
+        requests.post = _boom
+        payload2 = _json.loads(exa_search.invoke({"query": "проверка обрыва сети"}))
+        assert isinstance(payload2, dict)
+        assert "недоступен" in payload2["error"]
+    finally:
+        requests.post = real_post
+        OFFLINE = prev_offline
 
 
 if __name__ == "__main__":
