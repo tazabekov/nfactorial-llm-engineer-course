@@ -227,7 +227,8 @@ class AgentState(TypedDict):
     target_person: str                        # кого ищем (ФИО + контекст)
     playbook: List[str]                       # ключевая фишка ACE: правила поиска
     insights: str                             # выводы Reflector
-    messages: Annotated[list, add_messages]   # история вызовов тулов
+    messages: Annotated[list, add_messages]   # по одной сводке на итерацию (сам
+                                              # tool-трейс остаётся локальным в generator)
     iterations: int                           # счётчик циклов
     facts: Dict[str, str]                     # выход Generator → вход RAG_Upsert
     missing: List[str]                        # незакрытые слоты → вход Curator
@@ -299,6 +300,9 @@ def generator(state: AgentState) -> dict:
     convo = [SystemMessage(content=system),
              HumanMessage(content=f"Цель: {state['target_person']}")]
 
+    # Бюджет проверяется на границе хода, а не перед каждым вызовом: если модель
+    # вернула пачку tool_calls, мы обязаны ответить ToolMessage на КАЖДЫЙ из них,
+    # иначе следующий запрос к API упадёт. Перерасход ограничен размером пачки.
     calls_made = 0
     while calls_made < MAX_TOOL_CALLS:
         ai = llm.invoke(convo)
