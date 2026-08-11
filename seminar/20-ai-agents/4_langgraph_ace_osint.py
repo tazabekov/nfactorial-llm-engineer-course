@@ -10,6 +10,9 @@ Showcase 4 — LangGraph + ACE: Self-Evolving OSINT Agent
 import os
 import sys
 from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
 
 load_dotenv()
 MODEL = os.getenv("GENERATOR_MODEL", "gpt-5.6-terra")
@@ -90,6 +93,54 @@ def apply_playbook_ops(playbook: list[str], add: list[str],
         evicted.append(victim)
 
     return result, added, removed, evicted
+
+
+_STORE = None
+
+
+def get_store() -> Chroma:
+    """Ленивая инициализация Chroma. В offline/selftest — детерминированные фейковые эмбеддинги."""
+    global _STORE
+    if _STORE is None:
+        if OFFLINE or "--selftest" in sys.argv:
+            from langchain_core.embeddings import DeterministicFakeEmbedding
+            embeddings = DeterministicFakeEmbedding(size=64)
+        else:
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        _STORE = Chroma(collection_name="profiles",
+                        embedding_function=embeddings,
+                        persist_directory=CHROMA_DIR)
+    return _STORE
+
+
+@tool
+def query_profile(name: str) -> dict:
+    """Возвращает уже собранное досье на человека: {слот: значение}."""
+    got = get_store().get(where={"name": name})
+    dossier = {}
+    for doc, meta in zip(got["documents"], got["metadatas"]):
+        dossier[meta["slot"]] = doc
+    return dossier
+
+
+@tool
+def upsert_profile(name: str, facts: dict) -> dict:
+    """Создаёт или мержит факты в досье. Возвращает досье целиком после записи."""
+    current = query_profile.invoke({"name": name})
+    merged = {}
+    for slot, value in (facts or {}).items():
+        if slot not in SLOTS:
+            continue
+        new_value = merge_slot(current.get(slot, ""), str(value or ""))
+        if new_value:
+            merged[slot] = new_value
+    if merged:
+        get_store().add_texts(
+            texts=list(merged.values()),
+            metadatas=[{"name": name, "slot": s} for s in merged],
+            ids=[f"{name}::{s}" for s in merged],
+        )
+    return {**current, **merged}
 
 
 SELFTESTS = []
@@ -184,6 +235,41 @@ def test_apply_playbook_ops():
     assert removed7 == ["правило 0"]       # запросил Curator (индекс 3)
     assert evicted7 == ["правило 1"]       # выдавил лимит
     assert added7 == ["правило X", "правило Y"]
+
+
+@selftest
+def test_profile_roundtrip():
+    import tempfile
+    global CHROMA_DIR, _STORE
+    prev_dir, prev_store = CHROMA_DIR, _STORE
+    try:
+        CHROMA_DIR = tempfile.mkdtemp(prefix="chroma_selftest_")
+        _STORE = None
+
+        # пустая база — пустое досье
+        assert query_profile.invoke({"name": "Тест Тестов"}) == {}
+
+        upsert_profile.invoke({"name": "Тест Тестов",
+                               "facts": {"role_title": "CEO", "location": "Алматы"}})
+        got = query_profile.invoke({"name": "Тест Тестов"})
+        assert got["role_title"] == "CEO"
+        assert got["location"] == "Алматы"
+        assert "education" not in got
+
+        # повторный upsert мержит, а не дублирует
+        upsert_profile.invoke({"name": "Тест Тестов",
+                               "facts": {"role_title": "основатель"}})
+        got2 = query_profile.invoke({"name": "Тест Тестов"})
+        assert got2["role_title"] == "CEO; основатель"
+
+        # чужое имя не протекает
+        assert query_profile.invoke({"name": "Другой Человек"}) == {}
+
+        # неизвестные слоты отбрасываются
+        upsert_profile.invoke({"name": "Тест Тестов", "facts": {"хобби": "шахматы"}})
+        assert "хобби" not in query_profile.invoke({"name": "Тест Тестов"})
+    finally:
+        CHROMA_DIR, _STORE = prev_dir, prev_store
 
 
 if __name__ == "__main__":
