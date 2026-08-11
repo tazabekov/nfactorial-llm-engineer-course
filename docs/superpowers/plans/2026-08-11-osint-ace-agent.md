@@ -1032,6 +1032,31 @@ def test_playbook_persistence():
 
 
 @selftest
+def test_playbook_survives_corruption():
+    """Скрипт перезаписывает playbook.json каждый прогон — оборванная запись
+    не должна блокировать следующий запуск."""
+    import tempfile, os as _os
+    global PLAYBOOK_PATH
+    prev = PLAYBOOK_PATH
+    try:
+        PLAYBOOK_PATH = _os.path.join(tempfile.mkdtemp(prefix="pb_bad_"), "playbook.json")
+
+        with open(PLAYBOOK_PATH, "w", encoding="utf-8") as f:
+            f.write('["правило", "обрыв на сер')      # оборванный JSON
+        assert load_playbook() == BASE_PLAYBOOK
+
+        with open(PLAYBOOK_PATH, "w", encoding="utf-8") as f:
+            f.write("")                                # пустой файл
+        assert load_playbook() == BASE_PLAYBOOK
+
+        with open(PLAYBOOK_PATH, "w", encoding="utf-8") as f:
+            f.write('{"rules": []}')                   # валидный JSON, но не список
+        assert load_playbook() == BASE_PLAYBOOK
+    finally:
+        PLAYBOOK_PATH = prev
+
+
+@selftest
 def test_graph_compiles():
     graph = build(max_iter=3)
     assert graph is not None
@@ -1074,10 +1099,18 @@ def build(max_iter: int = MAX_ITER):
 
 
 def load_playbook() -> List[str]:
-    if not os.path.exists(PLAYBOOK_PATH):
+    """Читает плейбук с диска. Битый файл — не повод падать: скрипт перезаписывает
+    его в конце каждого прогона, и оборванная запись иначе заблокировала бы запуск."""
+    try:
+        with open(PLAYBOOK_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+        if not isinstance(saved, list):
+            raise ValueError("playbook.json должен содержать список правил")
+    except FileNotFoundError:
         return list(BASE_PLAYBOOK)
-    with open(PLAYBOOK_PATH, encoding="utf-8") as f:
-        saved = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"⚠️  {PLAYBOOK_PATH} повреждён ({e}), стартую с базового плейбука")
+        return list(BASE_PLAYBOOK)
     # базовые правила закреплены — восстанавливаем, если файл их потерял
     return list(BASE_PLAYBOOK) + [r for r in saved if r not in BASE_PLAYBOOK]
 
@@ -1101,7 +1134,12 @@ def main() -> None:
         reset_local_state()
     max_iter = MAX_ITER
     if "--max-iter" in sys.argv:
-        max_iter = int(sys.argv[sys.argv.index("--max-iter") + 1])
+        try:
+            max_iter = int(sys.argv[sys.argv.index("--max-iter") + 1])
+        except (IndexError, ValueError):
+            sys.exit("❌ --max-iter требует целое число, например: --max-iter 2")
+        if max_iter < 1:
+            sys.exit("❌ --max-iter должен быть не меньше 1")
     if not OFFLINE:
         require_keys()
 
@@ -1141,7 +1179,9 @@ if __name__ == "__main__":
 
 Run: `cd seminar/20-ai-agents && .venv/bin/python 4_langgraph_ace_osint.py --selftest`
 
-Expected: PASS — `12/12 проверок прошло`, exit code 0.
+Expected: PASS — `13/13 проверок прошло`, exit code 0.
+
+`--max-iter` parsing lives inside `main()` and is not selftested — exercising it would mean driving `main()`, which prompts for input and runs the graph. It is verified by hand in Task 9.
 
 - [ ] **Step 5: Commit**
 
