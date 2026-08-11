@@ -9,6 +9,7 @@ Showcase 4 — LangGraph + ACE: Self-Evolving OSINT Agent
 """
 import json
 import os
+import shutil
 import sys
 from typing import Annotated, Dict, List, Literal, TypedDict
 
@@ -395,6 +396,84 @@ def curator(state: AgentState) -> dict:
     return {"playbook": playbook}
 
 
+def make_router(max_iter: int):
+    """Единственное условное ребро графа — после Reflector."""
+    def route_after_reflector(state: AgentState) -> Literal["curator", "__end__"]:
+        if state["done"] or state["iterations"] >= max_iter:
+            return END
+        return "curator"
+    return route_after_reflector
+
+
+def build(max_iter: int = MAX_ITER):
+    g = StateGraph(AgentState)
+    g.add_node("generator", generator)
+    g.add_node("rag_upsert", rag_upsert)
+    g.add_node("reflector", reflector)
+    g.add_node("curator", curator)
+    g.add_edge(START, "generator")
+    g.add_edge("generator", "rag_upsert")
+    g.add_edge("rag_upsert", "reflector")
+    g.add_conditional_edges("reflector", make_router(max_iter), ["curator", END])
+    g.add_edge("curator", "generator")
+    return g.compile()
+
+
+def load_playbook() -> List[str]:
+    if not os.path.exists(PLAYBOOK_PATH):
+        return list(BASE_PLAYBOOK)
+    with open(PLAYBOOK_PATH, encoding="utf-8") as f:
+        saved = json.load(f)
+    # базовые правила закреплены — восстанавливаем, если файл их потерял
+    return list(BASE_PLAYBOOK) + [r for r in saved if r not in BASE_PLAYBOOK]
+
+
+def save_playbook(playbook: List[str]) -> None:
+    with open(PLAYBOOK_PATH, "w", encoding="utf-8") as f:
+        json.dump(playbook, f, ensure_ascii=False, indent=2)
+
+
+def reset_local_state() -> None:
+    shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+    if os.path.exists(PLAYBOOK_PATH):
+        os.remove(PLAYBOOK_PATH)
+    print("🧹 Сброшено: chroma_osint/ и playbook.json")
+
+
+def main() -> None:
+    global OFFLINE
+    OFFLINE = "--offline" in sys.argv
+    if "--reset" in sys.argv:
+        reset_local_state()
+    max_iter = MAX_ITER
+    if "--max-iter" in sys.argv:
+        max_iter = int(sys.argv[sys.argv.index("--max-iter") + 1])
+    if not OFFLINE:
+        require_keys()
+
+    target = input("Кого ищем? (ФИО + специальность + город, "
+                   "например «Арман Сулейменов, основатель школы nFactorial, Алматы»)\n> ").strip()
+    if not target:
+        sys.exit("Пустая цель — нечего искать.")
+
+    playbook = load_playbook()
+    print(f"\n📋 СТАРТОВЫЙ ПЛЕЙБУК:\n{format_playbook(playbook)}\n")
+
+    final = build(max_iter).invoke(
+        {"target_person": target, "playbook": playbook, "insights": "",
+         "messages": [], "iterations": 0, "facts": {}, "missing": [], "done": False},
+        {"recursion_limit": 25},
+    )
+    save_playbook(final["playbook"])
+
+    dossier = query_profile.invoke({"name": target})
+    print(f"\n{'=' * 60}\n📇 ИТОГОВОЕ ДОСЬЕ: {target}\n{'=' * 60}")
+    print(format_dossier(dossier))
+    print(f"\nИтераций: {final['iterations']} | "
+          f"Не закрыто слотов: {len(final['missing'])}")
+    print(f"\n📋 ФИНАЛЬНЫЙ ПЛЕЙБУК:\n{format_playbook(final['playbook'])}")
+
+
 SELFTESTS = []
 
 
@@ -618,7 +697,43 @@ def test_rag_upsert_node():
         CHROMA_DIR, _STORE = prev_dir, prev_store
 
 
+@selftest
+def test_router():
+    route = make_router(max_iter=3)
+    # досье собрано — выходим
+    assert route({"done": True, "missing": [], "iterations": 1}) == END
+    # есть пробелы и лимит не достигнут — идём к куратору
+    assert route({"done": False, "missing": ["education"], "iterations": 1}) == "curator"
+    # лимит достигнут — выходим даже с пробелами
+    assert route({"done": False, "missing": ["education"], "iterations": 3}) == END
+    assert route({"done": False, "missing": ["education"], "iterations": 4}) == END
+
+
+@selftest
+def test_playbook_persistence():
+    import tempfile, os as _os
+    global PLAYBOOK_PATH
+    prev = PLAYBOOK_PATH
+    try:
+        PLAYBOOK_PATH = _os.path.join(tempfile.mkdtemp(prefix="pb_"), "playbook.json")
+        # файла нет — отдаём базовый плейбук
+        assert load_playbook() == BASE_PLAYBOOK
+        save_playbook(BASE_PLAYBOOK + ["выученное правило"])
+        assert load_playbook() == BASE_PLAYBOOK + ["выученное правило"]
+    finally:
+        PLAYBOOK_PATH = prev
+
+
+@selftest
+def test_graph_compiles():
+    graph = build(max_iter=3)
+    assert graph is not None
+    nodes = set(graph.get_graph().nodes)
+    assert {"generator", "rag_upsert", "reflector", "curator"} <= nodes
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(run_selftest())
+    main()
     print("CLI появится в задаче 8")
