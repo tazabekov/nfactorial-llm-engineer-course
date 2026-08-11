@@ -40,6 +40,19 @@ BASE_PLAYBOOK = [
 
 OFFLINE = False
 
+
+def merge_slot(old: str, new: str) -> str:
+    """Детерминированный мерж значения слота: без LLM, без потери старого."""
+    old, new = (old or "").strip(), (new or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new[:SLOT_CHAR_CAP]
+    if new.lower() in old.lower():
+        return old
+    return f"{old}; {new}"[:SLOT_CHAR_CAP]
+
+
 SELFTESTS = []
 
 
@@ -69,6 +82,25 @@ def test_config_constants():
     assert set(SLOT_RU) == set(SLOTS)
     assert (MAX_ITER, MAX_TOOL_CALLS, PLAYBOOK_LIMIT, SLOT_CHAR_CAP) == (3, 6, 7, 500)
     assert len(BASE_PLAYBOOK) == 2
+
+
+@selftest
+def test_merge_slot():
+    # пустой слот — просто записываем
+    assert merge_slot("", "CEO") == "CEO"
+    # пустое новое значение ничего не портит
+    assert merge_slot("CEO", "") == "CEO"
+    # повтор не дублируется
+    assert merge_slot("CEO", "CEO") == "CEO"
+    # подстрока не дублируется
+    assert merge_slot("CEO компании nFactorial", "CEO") == "CEO компании nFactorial"
+    # новое значение дописывается
+    assert merge_slot("CEO", "основатель") == "CEO; основатель"
+    # пробелы обрезаются
+    assert merge_slot("  CEO  ", "  основатель  ") == "CEO; основатель"
+    # потолок соблюдается
+    long_old = "x" * (SLOT_CHAR_CAP - 2)
+    assert len(merge_slot(long_old, "новый факт")) <= SLOT_CHAR_CAP
 
 
 if __name__ == "__main__":
