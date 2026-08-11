@@ -540,21 +540,36 @@ def test_tools_offline():
 
 @selftest
 def test_exa_error_is_visible():
-    """Ошибка Exa должна дойти до LLM текстом, а не превратиться в пустой список."""
+    """Ошибка Exa должна дойти до LLM текстом, а не превратиться в пустой список.
+
+    Сеть не трогаем: подменяем requests.post, чтобы проверить обе ветки отказа.
+    """
     import json as _json
     global OFFLINE
-    prev_offline, prev_key = OFFLINE, os.environ.get("EXA_API_KEY")
+
+    class _Unauthorized:
+        status_code = 401
+        text = "unauthorized"
+
+    prev_offline, real_post = OFFLINE, requests.post
     try:
         OFFLINE = False
-        os.environ["EXA_API_KEY"] = "заведомо-неверный-ключ"
-        payload = _json.loads(exa_search.invoke({"query": "проверка ошибки"}))
-        assert isinstance(payload, dict) and "error" in payload
+
+        requests.post = lambda *a, **kw: _Unauthorized()
+        payload = _json.loads(exa_search.invoke({"query": "проверка кода ответа"}))
+        assert isinstance(payload, dict), "ошибка обязана быть объектом, а не списком"
+        assert "401" in payload["error"]
+
+        def _boom(*a, **kw):
+            raise requests.RequestException("сеть недоступна")
+
+        requests.post = _boom
+        payload2 = _json.loads(exa_search.invoke({"query": "проверка обрыва сети"}))
+        assert isinstance(payload2, dict)
+        assert "недоступен" in payload2["error"]
     finally:
+        requests.post = real_post
         OFFLINE = prev_offline
-        if prev_key is None:
-            os.environ.pop("EXA_API_KEY", None)
-        else:
-            os.environ["EXA_API_KEY"] = prev_key
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -857,15 +872,9 @@ def test_rag_upsert_node():
         assert stored["role_title"] == "инженер"
     finally:
         CHROMA_DIR, _STORE = prev_dir, prev_store
-
-
-@selftest
-def test_done_is_computed_not_trusted():
-    """done обязан выводиться из missing, иначе LLM объявит готовность с пустыми слотами."""
-    import inspect
-    src = inspect.getsource(reflector)
-    assert "not missing" in src, "done должен вычисляться как not missing"
 ```
+
+Only one selftest here. The `done = not missing` rule is verified behaviourally by `test_router` in Task 8 (which exercises both branches) and by the end-to-end run in Task 9 — not by asserting on `reflector`'s source text.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -948,7 +957,7 @@ def curator(state: AgentState) -> dict:
 
 Run: `cd seminar/20-ai-agents && .venv/bin/python 4_langgraph_ace_osint.py --selftest`
 
-Expected: PASS — `10/10 проверок прошло`, exit code 0.
+Expected: PASS — `9/9 проверок прошло`, exit code 0.
 
 - [ ] **Step 5: Commit**
 
@@ -1110,7 +1119,7 @@ if __name__ == "__main__":
 
 Run: `cd seminar/20-ai-agents && .venv/bin/python 4_langgraph_ace_osint.py --selftest`
 
-Expected: PASS — `13/13 проверок прошло`, exit code 0.
+Expected: PASS — `12/12 проверок прошло`, exit code 0.
 
 - [ ] **Step 5: Commit**
 
@@ -1205,7 +1214,7 @@ git commit -m "fix(seminar-20): address defects found in end-to-end verification
 | Conflict merge via `; `, 500-char cap | 2 |
 | LLM sees only the two search tools | 6 (`TOOLS` dict omits DB tools) |
 | Generator tool loop capped at 6 | 6 |
-| `done = not missing` in Python | 7 |
+| `done = not missing` in Python | 7 (implemented), 8 + 9 (verified) |
 | Curator returns ADD/REMOVE ops, 1-based | 7 |
 | Cap 7, pinned base rules | 3 |
 | Playbook printed every iteration | 7 |
