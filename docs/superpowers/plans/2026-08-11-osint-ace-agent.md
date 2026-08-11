@@ -14,6 +14,7 @@
 - Model comes from `os.getenv("GENERATOR_MODEL", "gpt-5.6-terra")`, matching showcases 1–3 in the same folder.
 - Slots, in this exact order: `role_title`, `organization`, `education`, `notable_work`, `online_presence`, `location`.
 - `MAX_ITER = 3`, `MAX_TOOL_CALLS = 6`, `PLAYBOOK_LIMIT = 7`, `SLOT_CHAR_CAP = 500`.
+- `MAX_TOOL_CALLS` is a budget checked at **turn boundaries**, not a hard per-call ceiling. If the model batches several tool calls into one turn, all of them run and the total can exceed the budget by that batch. This is deliberate: the OpenAI tool protocol requires every `tool_call` to have a matching `ToolMessage`, so breaking mid-batch would leave calls unanswered and fail the next request. Overshoot is bounded by one turn's batch size.
 - Chroma persists to `./chroma_osint`, playbook to `./playbook.json` — both relative to the current working directory.
 - The two base playbook rules are **pinned**: never evicted by the cap, and Curator's requests to remove them are ignored.
 - `remove` indices from Curator are **1-based** (they match the numbered list the model was shown).
@@ -746,7 +747,8 @@ class AgentState(TypedDict):
     target_person: str                        # кого ищем (ФИО + контекст)
     playbook: List[str]                       # ключевая фишка ACE: правила поиска
     insights: str                             # выводы Reflector
-    messages: Annotated[list, add_messages]   # история вызовов тулов
+    messages: Annotated[list, add_messages]   # по одной сводке на итерацию (сам
+                                              # tool-трейс остаётся локальным в generator)
     iterations: int                           # счётчик циклов
     facts: Dict[str, str]                     # выход Generator → вход RAG_Upsert
     missing: List[str]                        # незакрытые слоты → вход Curator
@@ -818,6 +820,9 @@ def generator(state: AgentState) -> dict:
     convo = [SystemMessage(content=system),
              HumanMessage(content=f"Цель: {state['target_person']}")]
 
+    # Бюджет проверяется на границе хода, а не перед каждым вызовом: если модель
+    # вернула пачку tool_calls, мы обязаны ответить ToolMessage на КАЖДЫЙ из них,
+    # иначе следующий запрос к API упадёт. Перерасход ограничен размером пачки.
     calls_made = 0
     while calls_made < MAX_TOOL_CALLS:
         ai = llm.invoke(convo)
