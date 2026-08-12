@@ -50,5 +50,5 @@ logs/
 .playwright-mcp
 
 # Seminar 20 — OSINT agent local state
-chroma_osint/
+chroma_osint*/
 playbook.json

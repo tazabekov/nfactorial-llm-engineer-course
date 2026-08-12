@@ -4,8 +4,9 @@ Showcase 4 — LangGraph + ACE: Self-Evolving OSINT Agent
 Агент собирает досье на человека и между итерациями переписывает
 собственный «плейбук» правил поиска (Agentic Context Engineering).
 
-Граф:  START → generator → rag_upsert → reflector ─(done|limit)→ END
-                   ▲                          └→ curator ─┘
+Граф:  START → generator → rag_upsert → reflector ─┬─(done | лимит)→ END
+                   ▲                               │
+                   └─────────── curator ←──────────┘
 """
 import json
 import os
@@ -79,7 +80,7 @@ def apply_playbook_ops(playbook: list[str], add: list[str],
     pinned = set(BASE_PLAYBOOK)
     result, removed, evicted = list(playbook), [], []
 
-    for idx in sorted({i for i in remove}, reverse=True):
+    for idx in sorted(set(remove), reverse=True):
         pos = idx - 1
         if not (0 <= pos < len(result)):
             continue
@@ -104,6 +105,17 @@ def apply_playbook_ops(playbook: list[str], add: list[str],
     return result, added, removed, evicted
 
 
+def decide_missing(dossier: Dict[str, str], reported: List[str]) -> List[str]:
+    """Слот незакрыт, если он пуст в досье ИЛИ Рефлектор усомнился в нём.
+
+    Рефлектор может только добавить сомнение, но не объявить готовность:
+    пустой слот остаётся в missing, что бы модель ни ответила.
+    """
+    empty = {s for s in SLOTS if not (dossier.get(s) or "").strip()}
+    doubted = {s for s in reported if s in SLOTS}
+    return sorted(empty | doubted, key=SLOTS.index)
+
+
 _STORE = None
 
 
@@ -111,14 +123,17 @@ def get_store() -> Chroma:
     """Ленивая инициализация Chroma. В offline/selftest — детерминированные фейковые эмбеддинги."""
     global _STORE
     if _STORE is None:
-        if OFFLINE or "--selftest" in sys.argv:
+        if OFFLINE:
             from langchain_core.embeddings import DeterministicFakeEmbedding
             embeddings = DeterministicFakeEmbedding(size=64)
         else:
             embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        # Фейковые эмбеддинги 64-мерные, настоящие — 1536. Коллекция Chroma имеет
+        # фиксированную размерность, поэтому офлайн-данные держим отдельно, иначе
+        # следующий запуск в другом режиме падает на add_texts.
         _STORE = Chroma(collection_name="profiles",
                         embedding_function=embeddings,
-                        persist_directory=CHROMA_DIR)
+                        persist_directory=f"{CHROMA_DIR}_offline" if OFFLINE else CHROMA_DIR)
     return _STORE
 
 
@@ -175,12 +190,16 @@ OFFLINE_FIXTURES = {
 }
 
 
-def require_keys() -> None:
-    """Падаем сразу, а не через три LLM-вызова."""
-    missing = [k for k in ("OPENAI_API_KEY", "EXA_API_KEY") if not os.getenv(k)]
+def require_keys(offline: bool) -> None:
+    """Падаем сразу, а не через три LLM-вызова.
+
+    --offline подменяет только веб-инструменты; узлы графа всё равно зовут OpenAI.
+    """
+    needed = ["OPENAI_API_KEY"] if offline else ["OPENAI_API_KEY", "EXA_API_KEY"]
+    missing = [k for k in needed if not os.getenv(k)]
     if missing:
         sys.exit(f"❌ Нет переменных окружения: {', '.join(missing)}. "
-                 f"Добавь их в .env в корне репозитория или запусти с --offline.")
+                 f"Добавь их в .env в корне репозитория.")
 
 
 @tool
@@ -316,6 +335,8 @@ def generator(state: AgentState) -> dict:
                                      tool_call_id=call["id"]))
             calls_made += 1
 
+    # У цикла tool-calling reasoning_effort="none": он механический. Извлечению
+    # фактов рассуждение полезно, поэтому здесь параметр не задаём.
     extracted = ChatOpenAI(model=MODEL).with_structured_output(Facts).invoke(
         convo + [HumanMessage(content="Верни извлечённые факты по слотам досье.")]
     )
@@ -355,7 +376,7 @@ def reflector(state: AgentState) -> dict:
         HumanMessage(content=f"Цель: {state['target_person']}\n\n"
                              f"Досье:\n{format_dossier(dossier)}"),
     ])
-    missing = [s for s in review.missing if s in SLOTS]
+    missing = decide_missing(dossier, review.missing)
     done = not missing
     status = "досье полное" if done else f"не хватает: {', '.join(missing)}"
     print(f"  🧐 Reflector: {status}\n     insight: {review.insights}")
@@ -371,7 +392,7 @@ CURATOR_SYSTEM = """Ты куратор контекста агента. У аг
 - add: 1-2 новых конкретных правила. Правило должно менять поведение поиска
   (что добавить в запрос, где искать, что перепроверить), а не описывать цель.
 - remove: номера правил, которые доказали свою бесполезность. Нумерация с 1.
-  Правила 1 и 2 базовые, их удалять нельзя.
+  Правила 1–{base_count} базовые, их удалять нельзя.
 
 Не переписывай плейбук целиком."""
 
@@ -379,7 +400,8 @@ CURATOR_SYSTEM = """Ты куратор контекста агента. У аг
 def curator(state: AgentState) -> dict:
     ops = ChatOpenAI(model=MODEL).with_structured_output(PlaybookOps).invoke([
         SystemMessage(content=CURATOR_SYSTEM.format(
-            playbook=format_playbook(state["playbook"]))),
+            playbook=format_playbook(state["playbook"]),
+            base_count=len(BASE_PLAYBOOK))),
         HumanMessage(content=f"Урок Рефлектора: {state['insights']}\n"
                              f"Не хватает слотов: {', '.join(state['missing'])}"),
     ])
@@ -443,9 +465,10 @@ def save_playbook(playbook: List[str]) -> None:
 
 def reset_local_state() -> None:
     shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+    shutil.rmtree(f"{CHROMA_DIR}_offline", ignore_errors=True)
     if os.path.exists(PLAYBOOK_PATH):
         os.remove(PLAYBOOK_PATH)
-    print("🧹 Сброшено: chroma_osint/ и playbook.json")
+    print("🧹 Сброшено: chroma_osint/, chroma_osint_offline/ и playbook.json")
 
 
 def main() -> None:
@@ -461,8 +484,7 @@ def main() -> None:
             sys.exit("❌ --max-iter требует целое число, например: --max-iter 2")
         if max_iter < 1:
             sys.exit("❌ --max-iter должен быть не меньше 1")
-    if not OFFLINE:
-        require_keys()
+    require_keys(OFFLINE)
 
     target = input("Кого ищем? (ФИО + специальность + город, "
                    "например «Арман Сулейменов, основатель школы nFactorial, Алматы»)\n> ").strip()
@@ -505,6 +527,9 @@ def run_selftest() -> int:
         except AssertionError as e:
             failures += 1
             print(f"  ❌ {fn.__name__}: {e}")
+        except Exception as e:
+            failures += 1
+            print(f"  💥 {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(SELFTESTS) - failures}/{len(SELFTESTS)} проверок прошло")
     return 1 if failures else 0
 
@@ -528,6 +553,8 @@ def test_merge_slot():
     assert merge_slot("CEO", "CEO") == "CEO"
     # подстрока не дублируется
     assert merge_slot("CEO компании nFactorial", "CEO") == "CEO компании nFactorial"
+    # подстрока сравнивается без учёта регистра
+    assert merge_slot("CEO компании", "ceo") == "CEO компании"
     # новое значение дописывается
     assert merge_slot("CEO", "основатель") == "CEO; основатель"
     # пробелы обрезаются
@@ -579,6 +606,24 @@ def test_apply_playbook_ops():
     assert removed7 == ["правило 0"]       # запросил Curator (индекс 3)
     assert evicted7 == ["правило 1"]       # выдавил лимит
     assert added7 == ["правило X", "правило Y"]
+    assert len(pb7) == PLAYBOOK_LIMIT
+
+
+@selftest
+def test_decide_missing():
+    full = {s: "значение" for s in SLOTS}
+    # модель молчит, досье полное → готово
+    assert decide_missing(full, []) == []
+    # модель не может объявить готовность при пустых слотах
+    assert decide_missing({}, []) == SLOTS
+    # пробелы не считаются заполненным слотом
+    assert decide_missing({**full, "education": "   "}, []) == ["education"]
+    # сомнение модели добавляется к пустым слотам
+    assert decide_missing(full, ["location"]) == ["location"]
+    # мусорные имена слотов от модели отбрасываются
+    assert decide_missing(full, ["хобби", "role_title"]) == ["role_title"]
+    # порядок совпадает с порядком SLOTS
+    assert decide_missing({}, []) == sorted(SLOTS, key=SLOTS.index)
 
 
 @selftest
@@ -772,5 +817,6 @@ def test_graph_compiles():
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
+        OFFLINE = True          # selftest никогда не ходит в сеть
         sys.exit(run_selftest())
     main()
