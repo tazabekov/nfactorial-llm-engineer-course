@@ -13,7 +13,7 @@
 - Everything ships in **one file**: `seminar/20-ai-agents/4_langgraph_ace_osint.py`. No `tests/` directory, no pytest dependency.
 - Model comes from `os.getenv("GENERATOR_MODEL", "gpt-5.6-terra")`, matching showcases 1–3 in the same folder.
 - Slots, in this exact order: `role_title`, `organization`, `education`, `notable_work`, `online_presence`, `location`.
-- `MAX_ITER = 3`, `MAX_TOOL_CALLS = 6`, `PLAYBOOK_LIMIT = 7`, `SLOT_CHAR_CAP = 500`.
+- `MAX_ITER = 3`, `MAX_TOOL_CALLS = 6`, `PLAYBOOK_LIMIT = 20`, `SLOT_CHAR_CAP = 500`.
 - `MAX_TOOL_CALLS` is a budget checked at **turn boundaries**, not a hard per-call ceiling. If the model batches several tool calls into one turn, all of them run and the total can exceed the budget by that batch. This is deliberate: the OpenAI tool protocol requires every `tool_call` to have a matching `ToolMessage`, so breaking mid-batch would leave calls unanswered and fail the next request. Overshoot is bounded by one turn's batch size.
 - Chroma persists to `./chroma_osint`, playbook to `./playbook.json` — both relative to the current working directory.
 - The two base playbook rules are **pinned**: never evicted by the cap, and Curator's requests to remove them are ignored.
@@ -94,7 +94,7 @@ def test_config_constants():
     assert SLOTS == ["role_title", "organization", "education",
                      "notable_work", "online_presence", "location"]
     assert set(SLOT_RU) == set(SLOTS)
-    assert (MAX_ITER, MAX_TOOL_CALLS, PLAYBOOK_LIMIT, SLOT_CHAR_CAP) == (3, 6, 7, 500)
+    assert (MAX_ITER, MAX_TOOL_CALLS, PLAYBOOK_LIMIT, SLOT_CHAR_CAP) == (3, 6, 20, 500)
     assert len(BASE_PLAYBOOK) == 2
 
 
@@ -131,7 +131,7 @@ SLOT_RU = {
 
 MAX_ITER = 3
 MAX_TOOL_CALLS = 6
-PLAYBOOK_LIMIT = 7
+PLAYBOOK_LIMIT = 20
 SLOT_CHAR_CAP = 500
 
 CHROMA_DIR = "./chroma_osint"

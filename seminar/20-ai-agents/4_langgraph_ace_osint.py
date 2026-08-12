@@ -40,7 +40,7 @@ SLOT_RU = {
 
 MAX_ITER = 3
 MAX_TOOL_CALLS = 6
-PLAYBOOK_LIMIT = 7
+PLAYBOOK_LIMIT = 20
 SLOT_CHAR_CAP = 500
 
 CHROMA_DIR = "./chroma_osint"
@@ -539,7 +539,7 @@ def test_config_constants():
     assert SLOTS == ["role_title", "organization", "education",
                      "notable_work", "online_presence", "location"]
     assert set(SLOT_RU) == set(SLOTS)
-    assert (MAX_ITER, MAX_TOOL_CALLS, PLAYBOOK_LIMIT, SLOT_CHAR_CAP) == (3, 6, 7, 500)
+    assert (MAX_ITER, MAX_TOOL_CALLS, PLAYBOOK_LIMIT, SLOT_CHAR_CAP) == (3, 6, 20, 500)
     assert len(BASE_PLAYBOOK) == 2
 
 
@@ -590,11 +590,11 @@ def test_apply_playbook_ops():
     assert pb5 == base and added5 == []
 
     # лимит вытесняет самое старое НЕзакреплённое правило
-    many = base + [f"правило {i}" for i in range(5)]
+    many = base + [f"правило {i}" for i in range(PLAYBOOK_LIMIT - len(BASE_PLAYBOOK))]
     assert len(many) == PLAYBOOK_LIMIT
     pb6, _, removed6, evicted6 = apply_playbook_ops(many, ["правило new"], [])
     assert len(pb6) == PLAYBOOK_LIMIT
-    assert pb6[:2] == base                 # базовые уцелели
+    assert pb6[:len(BASE_PLAYBOOK)] == base   # базовые уцелели
     assert "правило 0" not in pb6          # вытеснено самое старое
     assert "правило new" in pb6
     # вытеснение по лимиту не приписывается Curator'у
