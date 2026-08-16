@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+cache/
+output/
+assets-private/
+*.mp3
+*.mp4
+!assets/demo.mp4
