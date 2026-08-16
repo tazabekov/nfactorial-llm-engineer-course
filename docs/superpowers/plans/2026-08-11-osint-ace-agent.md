@@ -598,24 +598,28 @@ Expected: FAIL — `NameError: name 'exa_search' is not defined`.
 Add `import json` and `import requests` to the imports. Add below the DB section:
 
 ```python
+# Персона вымышлена: фикстуры уезжают в публичный репозиторий, а собирать
+# в них досье на реального человека незачем. Однофамилец из другой профессии
+# оставлен намеренно — на нём видно проблему, ради которой заведён плейбук.
 OFFLINE_FIXTURES = {
     "search": [
-        {"title": "Арман Сулейменов — nFactorial School",
-         "url": "https://example.org/armanulean",
-         "text": "Основатель школы программирования nFactorial в Алматы."},
-        {"title": "Однофамилец: Арман Сулейменов, строитель",
+        {"title": "Дана Ержанова — школа программирования «Сарыарқа Код»",
+         "url": "https://example.org/dana-yerzhanova",
+         "text": "Сооснователь и CTO школы программирования «Сарыарқа Код» в Караганде."},
+        {"title": "Однофамилец: Дана Ержанова, ветеринар",
          "url": "https://example.org/wrong-person",
-         "text": "Прораб строительной компании в Астане. Не имеет отношения к IT."},
+         "text": "Ветеринарная клиника в Костанае. К IT отношения не имеет."},
     ],
     "pages": {
-        "https://example.org/armanulean": (
-            "# Арман Сулейменов\n\n"
-            "Основатель школы программирования nFactorial (Алматы, Казахстан). "
-            "Выпускник Purdue University, финалист ACM ICPC. "
-            "Основал Zero To One Labs. GitHub: github.com/example.\n"
+        "https://example.org/dana-yerzhanova": (
+            "# Дана Ержанова\n\n"
+            "Сооснователь и CTO школы программирования «Сарыарқа Код» "
+            "(Караганда, Казахстан). Выпускница Северного технического "
+            "университета. Ведёт открытый курс по системному дизайну. "
+            "GitHub: github.com/example.\n"
         ),
         "https://example.org/wrong-person": (
-            "# Арман Сулейменов\n\nПрораб строительной компании в Астане.\n"
+            "# Дана Ержанова\n\nВетеринар клиники в Костанае.\n"
         ),
     },
 }
@@ -1144,7 +1148,7 @@ def main() -> None:
         require_keys()
 
     target = input("Кого ищем? (ФИО + специальность + город, "
-                   "например «Арман Сулейменов, основатель школы nFactorial, Алматы»)\n> ").strip()
+                   "например «Имя Фамилия, основатель школы программирования, Алматы»)\n> ").strip()
     if not target:
         sys.exit("Пустая цель — нечего искать.")
 
@@ -1206,7 +1210,7 @@ git commit -m "feat(seminar-20): assemble ACE graph with routing, persistence, a
 Run:
 ```bash
 cd seminar/20-ai-agents
-echo "Арман Сулейменов, основатель школы nFactorial, Алматы" | \
+echo "Дана Ержанова, сооснователь школы программирования, Караганда" | \
   .venv/bin/python 4_langgraph_ace_osint.py --offline --reset
 ```
 
@@ -1216,7 +1220,7 @@ Expected: the graph completes without a traceback, prints `🛠` tool lines, `�
 
 Read the output. Confirm the `📋 ПЛЕЙБУК после итерации N` block appears at least once and its contents differ from `📋 СТАРТОВЫЙ ПЛЕЙБУК`.
 
-If the run ended after one iteration with `done=True`, the offline fixtures were too generous. Fix by removing the `education` line from `OFFLINE_FIXTURES["pages"]["https://example.org/armanulean"]` so a slot stays empty, then re-run Step 1.
+If the run ended after one iteration with `done=True`, the offline fixtures were too generous. Fix by removing the `education` line from `OFFLINE_FIXTURES["pages"]["https://example.org/dana-yerzhanova"]` so a slot stays empty, then re-run Step 1.
 
 - [ ] **Step 3: Verify criterion 4 — persistence survives a restart**
 
@@ -1224,7 +1228,7 @@ Run:
 ```bash
 cd seminar/20-ai-agents
 ls -d chroma_osint playbook.json
-echo "Арман Сулейменов, основатель школы nFactorial, Алматы" | \
+echo "Дана Ержанова, сооснователь школы программирования, Караганда" | \
   .venv/bin/python 4_langgraph_ace_osint.py --offline
 ```
 
