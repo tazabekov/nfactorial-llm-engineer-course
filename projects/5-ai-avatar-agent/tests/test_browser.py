@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import pytest
@@ -47,6 +48,53 @@ async def test_throttle_waits_between_calls(monkeypatch):
     await pool._throttle()
     await pool._throttle()
     assert time.monotonic() - start >= 0.05
+
+
+async def test_start_launches_browser_only_once_under_concurrency(monkeypatch):
+    start_calls = []
+    launch_calls = []
+
+    class _StubBrowser:
+        async def close(self):
+            return None
+
+    class _StubChromium:
+        async def launch(self, **kwargs):
+            launch_calls.append(kwargs)
+            await asyncio.sleep(0)  # даём другим корутинам шанс вклиниться
+            return _StubBrowser()
+
+    class _StubPlaywright:
+        chromium = _StubChromium()
+
+        async def stop(self):
+            return None
+
+    class _StubAsyncPlaywright:
+        async def start(self):
+            start_calls.append(1)
+            await asyncio.sleep(0)  # тоже отдаём управление, чтобы вскрыть гонку
+            return _StubPlaywright()
+
+    monkeypatch.setattr(browser, "async_playwright", lambda: _StubAsyncPlaywright())
+
+    pool = browser.BrowserPool()
+    await asyncio.gather(*(pool.start() for _ in range(5)))
+
+    assert len(start_calls) == 1
+    assert len(launch_calls) == 1
+    assert pool._browser is not None
+
+
+async def test_throttle_serialises_concurrent_calls(monkeypatch):
+    monkeypatch.setattr(browser, "THROTTLE_SECONDS", 0.05)
+    pool = browser.BrowserPool()
+
+    start = time.monotonic()
+    await asyncio.gather(*(pool._throttle() for _ in range(4)))
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 3 * 0.05
 
 
 async def _no_sleep(_seconds):

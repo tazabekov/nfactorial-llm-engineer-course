@@ -41,12 +41,28 @@ class BrowserPool:
         self._browser: Browser | None = None
         self._last_navigation = 0.0
         self._lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._browser is not None:
             return
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=True)
+        # Отдельный лок именно под запуск: `_lock` держится throttle'ом на
+        # время сна между навигациями, и если бы запуск браузера ждал на нём
+        # же, старт процесса встал бы за троттлингом. Двойная проверка внутри
+        # лока нужна, чтобы при параллельных вызовах Chromium запускался
+        # только один раз, а не по разу на каждого дождавшегося.
+        async with self._start_lock:
+            if self._browser is not None:
+                return
+            self._playwright = await async_playwright().start()
+            try:
+                self._browser = await self._playwright.chromium.launch(headless=True)
+            except Exception:
+                # Частичный запуск: playwright поднялся, а браузер — нет.
+                # Останавливаем драйвер, чтобы не оставлять осиротевший процесс.
+                await self._playwright.stop()
+                self._playwright = None
+                raise
 
     async def stop(self) -> None:
         if self._browser is not None:
