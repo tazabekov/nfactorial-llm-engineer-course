@@ -69,13 +69,33 @@ class McpToolset:
         self.call_log: list[dict] = []
 
     async def open(self) -> None:
-        """Поднимает серверы и собирает список их инструментов."""
-        for name, target in self._servers.items():
-            client = Client(target)
-            await client.__aenter__()
-            self._clients[name] = client
-            for tool in await client.list_tools():
-                self._specs.append(tool_spec_from_mcp(name, tool))
+        """Поднимает серверы и собирает список их инструментов.
+
+        При частичном сбое (если один из серверов не открыть или list_tools() упадёт)
+        закрывает уже открытые клиенты, очищает внутреннее состояние и пробрасывает
+        исключение. После этого можно снова вызвать open().
+        """
+        opened_clients: dict[str, Client] = {}
+        try:
+            for name, target in self._servers.items():
+                client = Client(target)
+                await client.__aenter__()
+                opened_clients[name] = client
+                self._clients[name] = client
+                for tool in await client.list_tools():
+                    self._specs.append(tool_spec_from_mcp(name, tool))
+        except Exception:
+            # Закрываем все уже открытые клиенты в best-effort режиме
+            for name, client in opened_clients.items():
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    # Игнорируем ошибки при закрытии, чтобы не скрыть исходное исключение
+                    pass
+            # Возвращаем состояние в то же, что было до попытки открыть
+            self._clients.clear()
+            self._specs.clear()
+            raise
 
     async def close(self) -> None:
         for client in self._clients.values():

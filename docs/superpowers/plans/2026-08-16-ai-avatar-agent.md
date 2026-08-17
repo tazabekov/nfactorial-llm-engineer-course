@@ -1696,13 +1696,33 @@ class McpToolset:
         self.call_log: list[dict] = []
 
     async def open(self) -> None:
-        """Поднимает серверы и собирает список их инструментов."""
-        for name, target in self._servers.items():
-            client = Client(target)
-            await client.__aenter__()
-            self._clients[name] = client
-            for tool in await client.list_tools():
-                self._specs.append(tool_spec_from_mcp(name, tool))
+        """Поднимает серверы и собирает список их инструментов.
+
+        При частичном сбое (если один из серверов не открыть или list_tools() упадёт)
+        закрывает уже открытые клиенты, очищает внутреннее состояние и пробрасывает
+        исключение. После этого можно снова вызвать open().
+        """
+        opened_clients: dict[str, Client] = {}
+        try:
+            for name, target in self._servers.items():
+                client = Client(target)
+                await client.__aenter__()
+                opened_clients[name] = client
+                self._clients[name] = client
+                for tool in await client.list_tools():
+                    self._specs.append(tool_spec_from_mcp(name, tool))
+        except Exception:
+            # Закрываем все уже открытые клиенты в best-effort режиме
+            for name, client in opened_clients.items():
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    # Игнорируем ошибки при закрытии, чтобы не скрыть исходное исключение
+                    pass
+            # Возвращаем состояние в то же, что было до попытки открыть
+            self._clients.clear()
+            self._specs.clear()
+            raise
 
     async def close(self) -> None:
         for client in self._clients.values():
@@ -1740,13 +1760,23 @@ class McpToolset:
             self.call_log.append(entry)
             return json.dumps({"error": text}, ensure_ascii=False)
 
-        payload = result.data
-        if payload is None:
-            payload = result.structured_content
+        # structured_content уже приходит от fastmcp обычным словарём (он
+        # строится раньше, чем .data, и именно из него .data валидируется),
+        # поэтому это самый надёжный источник. .data используем только как
+        # запасной вариант и прогоняем через _to_jsonable, потому что это
+        # не словарь, а объект с доступом по атрибутам.
+        payload = result.structured_content
+        if payload is None and result.data is not None:
+            payload = _to_jsonable(result.data)
         if payload is None:
             payload = {"text": result.content[0].text if result.content else ""}
 
-        entry["result_size"] = len(payload.get("results", [])) if isinstance(payload, dict) else 0
+        if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+            entry["result_size"] = len(payload["results"])
+        elif isinstance(payload, list):
+            entry["result_size"] = len(payload)
+        else:
+            entry["result_size"] = 1 if payload else 0
         self.call_log.append(entry)
         return json.dumps(payload, ensure_ascii=False, default=str)
 ```

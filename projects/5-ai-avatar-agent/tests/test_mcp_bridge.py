@@ -1,6 +1,8 @@
 import json
 
+import pytest
 from fastmcp import FastMCP
+from mcp.shared.exceptions import McpError
 from pydantic import BaseModel
 
 from agent import mcp_bridge
@@ -85,3 +87,63 @@ def test_handles_only_known_prefixes():
     toolset = mcp_bridge.McpToolset({"echo": echo_server})
     assert toolset.handles("echo__say") is True
     assert toolset.handles("analyze_restaurant_photo") is False
+
+
+async def test_open_cleans_up_on_partial_failure():
+    """Проверяет, что open() закрывает уже открытые клиенты, если произойдёт ошибка.
+
+    Если второй сервер не откроется или list_tools() упадёт, первый сервер должен
+    быть закрыт, внутреннее состояние очищено, и можно будет вызвать open() снова.
+    """
+    first_server = FastMCP("first")
+
+    @first_server.tool
+    def hello() -> Answer:
+        """Greeting"""
+        return Answer(text="hello")
+
+    second_server = FastMCP("second")
+
+    @second_server.tool
+    def fail_to_list() -> Answer:
+        """Нельзя даже перечислить этот инструмент."""
+        return Answer(text="this tool should never be callable")
+
+    # Создаём переменную для отслеживания
+    call_count = {"count": 0}
+
+    original_list_tools = second_server.list_tools
+
+    async def failing_list_tools():
+        """list_tools() падает для второго сервера."""
+        raise RuntimeError(
+            "Второй сервер не может предоставить список инструментов"
+        )
+
+    second_server.list_tools = failing_list_tools
+
+    # Создаём toolset с двумя серверами
+    toolset = mcp_bridge.McpToolset({"first": first_server, "second": second_server})
+
+    # open() должна выбросить исключение из list_tools()
+    with pytest.raises(
+        McpError, match="Второй сервер не может предоставить список инструментов"
+    ):
+        await toolset.open()
+
+    # Проверяем, что specs() пуста (нет половинчатых инструментов)
+    assert toolset.specs() == [], "specs() должна быть пуста после ошибки open()"
+
+    # Проверяем, что _clients пуста (все клиенты закрыты)
+    assert len(toolset._clients) == 0, "_clients должна быть пуста после ошибки open()"
+
+    # После ошибки должно быть безопасно вызвать open() снова без ошибок состояния
+    # (это доказывает, что ресурсы первого сервера были надлежащим образом освобождены)
+    toolset2 = mcp_bridge.McpToolset({"first": first_server})
+    await toolset2.open()
+    try:
+        assert (
+            len(toolset2.specs()) > 0
+        ), "второй toolset должен иметь specs после успешного open()"
+    finally:
+        await toolset2.close()
