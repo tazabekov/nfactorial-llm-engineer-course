@@ -2241,12 +2241,88 @@ def test_trim_history_keeps_last_messages():
     assert trimmed[-1]["content"] == "29"
 
 
+def _assert_pairing_invariant(history):
+    """Для каждого assistant-сообщения с tool_calls в history все его
+    call_id должны быть отвечены, и у каждого tool-сообщения должен быть
+    его assistant-родитель в history."""
+    answered_ids = {
+        m["tool_call_id"] for m in history if isinstance(m, dict) and m.get("role") == "tool"
+    }
+    parent_ids = set()
+    for message in history:
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            call_id = call["id"] if isinstance(call, dict) else call.id
+            parent_ids.add(call_id)
+            assert call_id in answered_ids, f"tool_call {call_id} остался без ответа"
+    for message in history:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            assert message["tool_call_id"] in parent_ids, (
+                f"tool-сообщение {message['tool_call_id']} осиротело: assistant-родитель обрезан"
+            )
+
+
+def test_trim_history_never_severs_tool_call_pairing():
+    """Дефект 1 (round 2): если обрезка по лимиту падает ровно между
+    assistant-сообщением с tool_calls и его ответами, история после
+    trim_history не должна начинаться с осиротевших tool-сообщений. Против
+    старого блочного среза messages[-limit:] этот тест падает: первым
+    сообщением среза оказывается tool-ответ "a", чей assistant-родитель
+    отрезан."""
+    messages = [{"role": "user", "content": f"filler-{i}"} for i in range(5)]
+    messages.append(
+        FakeMessage(
+            tool_calls=[
+                FakeToolCall("a", "twogis__search_restaurants", {"query": "1"}),
+                FakeToolCall("b", "twogis__search_restaurants", {"query": "2"}),
+            ]
+        )
+    )
+    messages.append({"role": "tool", "tool_call_id": "a", "content": "{}"})
+    messages.append({"role": "tool", "tool_call_id": "b", "content": "{}"})
+    messages += [{"role": "user", "content": f"tail-{i}"} for i in range(12)]
+    assert len(messages) == 20
+
+    # limit=14 => блочный срез начинается ровно с tool-сообщения "a"
+    # (индекс 6), отрезая его assistant-родителя на индексе 5.
+    trimmed = llm.trim_history(messages, limit=14)
+
+    blind_slice = messages[-14:]
+    assert isinstance(blind_slice[0], dict) and blind_slice[0].get("role") == "tool"
+
+    _assert_pairing_invariant(trimmed)
+    assert trimmed[0] != blind_slice[0] or trimmed[0].get("role") != "tool"
+
+
+def test_trim_history_drops_leading_orphaned_tool_message():
+    """Осиротевшее tool-сообщение (родитель обрезан) никогда не должно
+    оказаться первым в результате trim_history."""
+    messages = [{"role": "tool", "tool_call_id": "orphan", "content": "{}"}]
+    messages += [{"role": "user", "content": str(i)} for i in range(9)]
+    trimmed = llm.trim_history(messages, limit=10)
+    assert all(
+        not (isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") == "orphan")
+        for m in trimmed
+    )
+
+
 def test_build_user_message_with_image(tmp_path):
     image = tmp_path / "p.jpg"
     image.write_bytes(b"\xff\xd8\xff\xe0")
     message = llm.build_user_message("что это", str(image))
     kinds = [part["type"] for part in message["content"]]
     assert "image_url" in kinds
+
+
+def test_build_user_message_missing_image_degrades_to_text():
+    """Дефект 2 (round 2): пропавший файл фото не должен ронять
+    build_user_message — сообщение должно деградировать до текстового с
+    честной припиской, аналогично analyze_restaurant_photo в skills.py."""
+    message = llm.build_user_message("что это", "/no/such/file.jpg")
+    assert isinstance(message["content"], str)
+    assert "что это" in message["content"]
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -2295,17 +2371,95 @@ CAP_REACHED_MESSAGE = (
 )
 
 
+def _msg_role(message: Any) -> str:
+    """Роль сообщения независимо от формы: dict (user/tool) или raw SDK-объект
+    (assistant — сырые ответы модели в истории всегда только ассистентские)."""
+    if isinstance(message, dict):
+        return message.get("role", "")
+    return "assistant"
+
+
+def _msg_tool_calls(message: Any) -> list:
+    """tool_calls сообщения независимо от формы, либо пустой список."""
+    if isinstance(message, dict):
+        return message.get("tool_calls") or []
+    return getattr(message, "tool_calls", None) or []
+
+
+def _call_id(call: Any) -> str:
+    return call["id"] if isinstance(call, dict) else call.id
+
+
+def _msg_tool_call_id(message: Any) -> str | None:
+    if isinstance(message, dict):
+        return message.get("tool_call_id")
+    return getattr(message, "tool_call_id", None)
+
+
 def trim_history(messages: list, limit: int = MAX_HISTORY_MESSAGES) -> list:
-    """Оставляет последние сообщения: суммаризация для этого проекта не окупается."""
-    return messages[-limit:] if len(messages) > limit else messages
+    """Оставляет последние сообщения, но не в ущерб парности tool-вызовов.
+
+    Инвариант, который обязан выполняться на выходе: для каждого assistant-
+    сообщения с tool_calls в результате присутствуют tool-сообщения на ВСЕ его
+    call_id, и у каждого tool-сообщения в результате есть его assistant-
+    родитель. Простая обрезка messages[-limit:] ничего не знает про роли и
+    может отрезать историю ровно между assistant-сообщением с tool_calls и
+    его ответами (или оставить только хвост таких ответов) — тогда в начале
+    среза окажется "осиротевшее" tool-сообщение или assistant с недоответившим
+    tool_calls, и следующий вызов API с такой историей будет отклонён.
+
+    Поэтому после обрезки по количеству мы проходим от начала среза и убираем
+    подряд: (а) tool-сообщения, чей assistant-родитель уже не попал в срез,
+    и (б) assistant-сообщения с tool_calls, не все call_id которых нашли
+    ответ внутри среза (вместе с теми их ответами, что всё-таки попали —
+    иначе они сами станут осиротевшими). Хвост среза трогать не нужно: он
+    всегда заканчивается на завершённом обмене (см. run_turn).
+    """
+    sliced = messages[-limit:] if len(messages) > limit else list(messages)
+
+    result = list(sliced)
+    changed = True
+    while changed and result:
+        changed = False
+        head = result[0]
+        if _msg_role(head) == "tool":
+            result.pop(0)
+            changed = True
+            continue
+        calls = _msg_tool_calls(head)
+        if calls:
+            ids = {_call_id(c) for c in calls}
+            present_ids = {
+                _msg_tool_call_id(m) for m in result if _msg_role(m) == "tool"
+            }
+            if not ids.issubset(present_ids):
+                result.pop(0)
+                result = [
+                    m
+                    for m in result
+                    if not (_msg_role(m) == "tool" and _msg_tool_call_id(m) in ids)
+                ]
+                changed = True
+    return result
 
 
 def build_user_message(text: str, image_path: str | None) -> dict:
-    """Собирает сообщение пользователя, при наличии фото — мультимодальное."""
+    """Собирает сообщение пользователя, при наличии фото — мультимодальное.
+
+    Если файл фото пропал или не читается, не роняем ход исключением (как и
+    analyze_restaurant_photo в agent/skills.py) — деградируем до текстового
+    сообщения с честной припиской, что фото прочитать не удалось.
+    """
     if not image_path:
         return {"role": "user", "content": text}
-    mime = mimetypes.guess_type(image_path)[0] or "image/jpeg"
-    data_url = f"data:{mime};base64,{encode_image(image_path)}"
+    try:
+        mime = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+        data_url = f"data:{mime};base64,{encode_image(image_path)}"
+    except OSError as error:
+        return {
+            "role": "user",
+            "content": f"{text}\n\n(Не удалось прочитать присланное фото: {error})",
+        }
     return {
         "role": "user",
         "content": [
@@ -2434,7 +2588,7 @@ def _is_history_message(message: Any) -> bool:
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_llm.py -v`
-Expected: PASS, 9 passed.
+Expected: PASS, 12 passed.
 
 - [ ] **Step 5: Коммит**
 

@@ -34,17 +34,95 @@ CAP_REACHED_MESSAGE = (
 )
 
 
+def _msg_role(message: Any) -> str:
+    """Роль сообщения независимо от формы: dict (user/tool) или raw SDK-объект
+    (assistant — сырые ответы модели в истории всегда только ассистентские)."""
+    if isinstance(message, dict):
+        return message.get("role", "")
+    return "assistant"
+
+
+def _msg_tool_calls(message: Any) -> list:
+    """tool_calls сообщения независимо от формы, либо пустой список."""
+    if isinstance(message, dict):
+        return message.get("tool_calls") or []
+    return getattr(message, "tool_calls", None) or []
+
+
+def _call_id(call: Any) -> str:
+    return call["id"] if isinstance(call, dict) else call.id
+
+
+def _msg_tool_call_id(message: Any) -> str | None:
+    if isinstance(message, dict):
+        return message.get("tool_call_id")
+    return getattr(message, "tool_call_id", None)
+
+
 def trim_history(messages: list, limit: int = MAX_HISTORY_MESSAGES) -> list:
-    """Оставляет последние сообщения: суммаризация для этого проекта не окупается."""
-    return messages[-limit:] if len(messages) > limit else messages
+    """Оставляет последние сообщения, но не в ущерб парности tool-вызовов.
+
+    Инвариант, который обязан выполняться на выходе: для каждого assistant-
+    сообщения с tool_calls в результате присутствуют tool-сообщения на ВСЕ его
+    call_id, и у каждого tool-сообщения в результате есть его assistant-
+    родитель. Простая обрезка messages[-limit:] ничего не знает про роли и
+    может отрезать историю ровно между assistant-сообщением с tool_calls и
+    его ответами (или оставить только хвост таких ответов) — тогда в начале
+    среза окажется "осиротевшее" tool-сообщение или assistant с недоответившим
+    tool_calls, и следующий вызов API с такой историей будет отклонён.
+
+    Поэтому после обрезки по количеству мы проходим от начала среза и убираем
+    подряд: (а) tool-сообщения, чей assistant-родитель уже не попал в срез,
+    и (б) assistant-сообщения с tool_calls, не все call_id которых нашли
+    ответ внутри среза (вместе с теми их ответами, что всё-таки попали —
+    иначе они сами станут осиротевшими). Хвост среза трогать не нужно: он
+    всегда заканчивается на завершённом обмене (см. run_turn).
+    """
+    sliced = messages[-limit:] if len(messages) > limit else list(messages)
+
+    result = list(sliced)
+    changed = True
+    while changed and result:
+        changed = False
+        head = result[0]
+        if _msg_role(head) == "tool":
+            result.pop(0)
+            changed = True
+            continue
+        calls = _msg_tool_calls(head)
+        if calls:
+            ids = {_call_id(c) for c in calls}
+            present_ids = {
+                _msg_tool_call_id(m) for m in result if _msg_role(m) == "tool"
+            }
+            if not ids.issubset(present_ids):
+                result.pop(0)
+                result = [
+                    m
+                    for m in result
+                    if not (_msg_role(m) == "tool" and _msg_tool_call_id(m) in ids)
+                ]
+                changed = True
+    return result
 
 
 def build_user_message(text: str, image_path: str | None) -> dict:
-    """Собирает сообщение пользователя, при наличии фото — мультимодальное."""
+    """Собирает сообщение пользователя, при наличии фото — мультимодальное.
+
+    Если файл фото пропал или не читается, не роняем ход исключением (как и
+    analyze_restaurant_photo в agent/skills.py) — деградируем до текстового
+    сообщения с честной припиской, что фото прочитать не удалось.
+    """
     if not image_path:
         return {"role": "user", "content": text}
-    mime = mimetypes.guess_type(image_path)[0] or "image/jpeg"
-    data_url = f"data:{mime};base64,{encode_image(image_path)}"
+    try:
+        mime = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+        data_url = f"data:{mime};base64,{encode_image(image_path)}"
+    except OSError as error:
+        return {
+            "role": "user",
+            "content": f"{text}\n\n(Не удалось прочитать присланное фото: {error})",
+        }
     return {
         "role": "user",
         "content": [

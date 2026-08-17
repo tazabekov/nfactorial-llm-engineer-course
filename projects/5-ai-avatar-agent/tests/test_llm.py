@@ -215,9 +215,83 @@ def test_trim_history_keeps_last_messages():
     assert trimmed[-1]["content"] == "29"
 
 
+def _assert_pairing_invariant(history):
+    """Для каждого assistant-сообщения с tool_calls в history все его
+    call_id должны быть отвечены, и у каждого tool-сообщения должен быть
+    его assistant-родитель в history."""
+    answered_ids = {
+        m["tool_call_id"] for m in history if isinstance(m, dict) and m.get("role") == "tool"
+    }
+    parent_ids = set()
+    for message in history:
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            call_id = call["id"] if isinstance(call, dict) else call.id
+            parent_ids.add(call_id)
+            assert call_id in answered_ids, f"tool_call {call_id} остался без ответа"
+    for message in history:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            assert message["tool_call_id"] in parent_ids, (
+                f"tool-сообщение {message['tool_call_id']} осиротело: assistant-родитель обрезан"
+            )
+
+
+def test_trim_history_never_severs_tool_call_pairing():
+    """Дефект 1: если обрезка по лимиту падает ровно между assistant-
+    сообщением с tool_calls и его ответами, история после trim_history не
+    должна начинаться с осиротевших tool-сообщений. Против старого блочного
+    среза messages[-limit:] этот тест падает: первым сообщением среза
+    оказывается tool-ответ "a", чей assistant-родитель отрезан."""
+    messages = [{"role": "user", "content": f"filler-{i}"} for i in range(5)]
+    messages.append(
+        FakeMessage(
+            tool_calls=[
+                FakeToolCall("a", "twogis__search_restaurants", {"query": "1"}),
+                FakeToolCall("b", "twogis__search_restaurants", {"query": "2"}),
+            ]
+        )
+    )
+    messages.append({"role": "tool", "tool_call_id": "a", "content": "{}"})
+    messages.append({"role": "tool", "tool_call_id": "b", "content": "{}"})
+    messages += [{"role": "user", "content": f"tail-{i}"} for i in range(12)]
+    assert len(messages) == 20
+
+    # limit=14 => блочный срез начинается ровно с tool-сообщения "a"
+    # (индекс 6), отрезая его assistant-родителя на индексе 5.
+    trimmed = llm.trim_history(messages, limit=14)
+
+    blind_slice = messages[-14:]
+    assert isinstance(blind_slice[0], dict) and blind_slice[0].get("role") == "tool"
+
+    _assert_pairing_invariant(trimmed)
+    assert trimmed[0] != blind_slice[0] or trimmed[0].get("role") != "tool"
+
+
+def test_trim_history_drops_leading_orphaned_tool_message():
+    """Осиротевшее tool-сообщение (родитель обрезан) никогда не должно
+    оказаться первым в результате trim_history."""
+    messages = [{"role": "tool", "tool_call_id": "orphan", "content": "{}"}]
+    messages += [{"role": "user", "content": str(i)} for i in range(9)]
+    trimmed = llm.trim_history(messages, limit=10)
+    assert all(
+        not (isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") == "orphan")
+        for m in trimmed
+    )
+
+
 def test_build_user_message_with_image(tmp_path):
     image = tmp_path / "p.jpg"
     image.write_bytes(b"\xff\xd8\xff\xe0")
     message = llm.build_user_message("что это", str(image))
     kinds = [part["type"] for part in message["content"]]
     assert "image_url" in kinds
+
+
+def test_build_user_message_missing_image_degrades_to_text():
+    """Дефект 2: пропавший файл фото не должен ронять build_user_message —
+    сообщение должно деградировать до текстового с честной припиской."""
+    message = llm.build_user_message("что это", "/no/such/file.jpg")
+    assert isinstance(message["content"], str)
+    assert "что это" in message["content"]
