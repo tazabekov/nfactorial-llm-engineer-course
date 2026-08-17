@@ -953,6 +953,47 @@ async def test_parser_failure_yields_error_and_no_results(monkeypatch):
         result = await client.call_tool("search_restaurants", {"query": "что-то новое"})
     assert result.data.results == []
     assert "недоступен" in result.data.error
+
+
+async def test_offline_cache_does_not_leak_into_live_mode(monkeypatch):
+    query = "уник-запрос-неймспейс"
+
+    # Сначала кладём результат в кэш в офлайн-режиме.
+    monkeypatch.setattr(server, "OFFLINE", True)
+    async with Client(server.mcp) as client:
+        offline_result = await client.call_tool("search_restaurants", {"query": query})
+    assert offline_result.data.cached is False
+
+    # Переключаемся в боевой режим и убеждаемся, что данные из офлайн-кэша
+    # не отдаются: инструмент реально идёт за данными через fetch_html.
+    monkeypatch.setattr(server, "OFFLINE", False)
+    calls = []
+
+    async def fake_fetch(url, selector, cookies=None):
+        calls.append(url)
+        return (server.FIXTURES_DIR / "twogis_search.html").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(server.POOL, "fetch_html", fake_fetch)
+    async with Client(server.mcp) as client:
+        live_result = await client.call_tool("search_restaurants", {"query": query})
+
+    assert len(calls) == 1
+    assert live_result.data.cached is False
+
+
+async def test_parser_exception_is_caught_and_reported_as_error(monkeypatch):
+    monkeypatch.setattr(server, "OFFLINE", True)
+
+    def broken_parser(html, limit):
+        raise ValueError("неожиданная разметка")
+
+    monkeypatch.setattr(server, "parse_restaurants", broken_parser)
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(
+            "search_restaurants", {"query": "запрос-с-битым-парсером"}
+        )
+    assert result.data.results == []
+    assert "неожиданная разметка" in result.data.error
 ```
 
 > **Примечание (по факту реализации):** `result.data` в fastmcp 3.4.7 — это
@@ -960,6 +1001,15 @@ async def test_parser_failure_yields_error_and_no_results(monkeypatch):
 > доступ к полям идёт через атрибуты (`result.data.error`), а не через
 > `result.data["error"]`. Сигнатура `fetch_html` также получила `cookies`
 > (см. Step 3) — фейковые фетчеры в тестах должны принимать этот параметр.
+>
+> **Примечание (ревью, раунд 1):** кэш офлайн- и боевого режимов должен жить
+> в разных неймспейсах (`test_offline_cache_does_not_leak_into_live_mode`) —
+> иначе фикстура, закэшированная под `AVATAR_AGENT_OFFLINE=1`, может 24 часа
+> отдаваться как настоящий боевой результат после отключения офлайн-режима.
+> `parse_restaurants` должен вызываться внутри `try`/`except`
+> (`test_parser_exception_is_caught_and_reported_as_error`) — иначе исключение
+> парсера долетает до LLM как сырая ошибка протокола MCP, а не как заполненное
+> поле `error` из контракта инструмента.
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
 
@@ -1003,6 +1053,10 @@ mcp = FastMCP(
 POOL = BrowserPool()
 CARD_WAIT_SELECTOR = "a[href*='/firm/']"
 NAMESPACE = "twogis"
+# Офлайн-фикстуры и живые данные кэшируются в разных неймспейсах: иначе
+# результат, закэшированный в офлайн-режиме, мог бы «просочиться» в боевой
+# ответ после переключения AVATAR_AGENT_OFFLINE обратно на 0 (и наоборот).
+NAMESPACE_OFFLINE = "twogis-offline"
 
 # 2ГИС перед реальным контентом показывает интерстишл «обновите браузер» —
 # он пропадает, если заранее подставить эту куку (так делает и обычный клик
@@ -1034,8 +1088,11 @@ async def search_restaurants(
         Список заведений с адресом, рейтингом, кухней и часами работы.
         При неудаче список пуст, а причина указана в поле error.
     """
+    # Неймспейс выбираем в момент вызова (а не при импорте модуля), потому что
+    # тесты подменяют server.OFFLINE через monkeypatch уже после импорта.
+    namespace = NAMESPACE_OFFLINE if OFFLINE else NAMESPACE
     cache_key = f"{query}|{location}|{limit}"
-    cached = cache_get(NAMESPACE, cache_key)
+    cached = cache_get(namespace, cache_key)
     if cached is not None:
         return SearchResult(**{**cached, "cached": True})
 
@@ -1047,10 +1104,10 @@ async def search_restaurants(
             html = await with_retry(
                 lambda: POOL.fetch_html(url, CARD_WAIT_SELECTOR, cookies=_TWOGIS_COOKIES)
             )
+        restaurants = parse_restaurants(html, limit=limit)
     except Exception as error:  # noqa: BLE001 — наружу отдаём текст, а не трейсбек
         return SearchResult(results=[], error=f"Не удалось получить данные 2GIS: {error}")
 
-    restaurants = parse_restaurants(html, limit=limit)
     if not restaurants:
         return SearchResult(
             results=[],
@@ -1058,7 +1115,7 @@ async def search_restaurants(
         )
 
     result = SearchResult(results=restaurants)
-    cache_set(NAMESPACE, cache_key, result.model_dump())
+    cache_set(namespace, cache_key, result.model_dump())
     return result
 
 
@@ -1066,10 +1123,15 @@ if __name__ == "__main__":
     mcp.run()
 ```
 
+> **Примечание (ревью, раунд 1):** `parse_restaurants` вызывается внутри
+> `try`/`except` вместе с получением html — так исключение парсера тоже
+> превращается в заполненное поле `error`, а не улетает наружу как сырая
+> ошибка протокола MCP.
+
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_twogis_server.py -v`
-Expected: PASS, 4 passed.
+Expected: PASS, 6 passed.
 
 - [ ] **Step 5: Проверить сервер как настоящий процесс**
 
@@ -1341,6 +1403,10 @@ POOL = BrowserPool()
 CATALOG_URL = "https://chocolife.me/restorany-kafe-i-bary/"
 CARD_WAIT_SELECTOR = "a[href*='deal']"
 NAMESPACE = "chocolife"
+# Как и в twogis/server.py: офлайн-фикстуры и живые данные кэшируются в
+# разных неймспейсах, иначе фикстура, закэшированная под
+# AVATAR_AGENT_OFFLINE=1, может 24 часа отдаваться как боевой результат.
+NAMESPACE_OFFLINE = "chocolife-offline"
 
 
 def _offline_html() -> str:
@@ -1364,8 +1430,11 @@ async def search_deals(
         Список акций с ценами до и после скидки и ссылкой на предложение.
         При неудаче список пуст, а причина указана в поле error.
     """
+    # Неймспейс выбираем в момент вызова, а не при импорте модуля: тесты
+    # подменяют server.OFFLINE через monkeypatch уже после импорта.
+    namespace = NAMESPACE_OFFLINE if OFFLINE else NAMESPACE
     cache_key = f"{category}|{city}|{limit}"
-    cached = cache_get(NAMESPACE, cache_key)
+    cached = cache_get(namespace, cache_key)
     if cached is not None:
         return DealsResult(**{**cached, "cached": True})
 
@@ -1373,10 +1442,10 @@ async def search_deals(
         html = _offline_html() if OFFLINE else await with_retry(
             lambda: POOL.fetch_html(CATALOG_URL, CARD_WAIT_SELECTOR)
         )
+        deals = parse_deals(html, limit=limit)
     except Exception as error:  # noqa: BLE001
         return DealsResult(results=[], error=f"Не удалось получить данные Chocolife: {error}")
 
-    deals = parse_deals(html, limit=limit)
     if not deals:
         return DealsResult(
             results=[],
@@ -1384,13 +1453,23 @@ async def search_deals(
         )
 
     result = DealsResult(results=deals)
-    cache_set(NAMESPACE, cache_key, result.model_dump())
+    cache_set(namespace, cache_key, result.model_dump())
     return result
 
 
 if __name__ == "__main__":
     mcp.run()
 ```
+
+> **Примечание (ревью Task 5, раунд 1):** та же связка правок из
+> `mcp_servers/twogis/server.py` применена и здесь — отдельный неймспейс
+> кэша для офлайн/боевого режима и `parse_deals` внутри `try`/`except`,
+> чтобы исключение парсера превращалось в заполненный `error`, а не
+> улетало наружу как сырая ошибка протокола MCP. При написании теста для
+> Step 2 добавить туда же аналоги
+> `test_offline_cache_does_not_leak_into_live_mode` и
+> `test_parser_exception_is_caught_and_reported_as_error` из
+> `tests/test_twogis_server.py`.
 
 - [ ] **Step 6: Запустить тесты**
 

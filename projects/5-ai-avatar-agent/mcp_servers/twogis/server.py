@@ -30,6 +30,10 @@ mcp = FastMCP(
 POOL = BrowserPool()
 CARD_WAIT_SELECTOR = "a[href*='/firm/']"
 NAMESPACE = "twogis"
+# Офлайн-фикстуры и живые данные кэшируются в разных неймспейсах: иначе
+# результат, закэшированный в офлайн-режиме, мог бы «просочиться» в боевой
+# ответ после переключения AVATAR_AGENT_OFFLINE обратно на 0 (и наоборот).
+NAMESPACE_OFFLINE = "twogis-offline"
 
 # 2ГИС перед реальным контентом показывает интерстишл «обновите браузер» —
 # он пропадает, если заранее подставить эту куку (так делает и обычный клик
@@ -61,8 +65,11 @@ async def search_restaurants(
         Список заведений с адресом, рейтингом, кухней и часами работы.
         При неудаче список пуст, а причина указана в поле error.
     """
+    # Неймспейс выбираем в момент вызова (а не при импорте модуля), потому что
+    # тесты подменяют server.OFFLINE через monkeypatch уже после импорта.
+    namespace = NAMESPACE_OFFLINE if OFFLINE else NAMESPACE
     cache_key = f"{query}|{location}|{limit}"
-    cached = cache_get(NAMESPACE, cache_key)
+    cached = cache_get(namespace, cache_key)
     if cached is not None:
         return SearchResult(**{**cached, "cached": True})
 
@@ -74,10 +81,10 @@ async def search_restaurants(
             html = await with_retry(
                 lambda: POOL.fetch_html(url, CARD_WAIT_SELECTOR, cookies=_TWOGIS_COOKIES)
             )
+        restaurants = parse_restaurants(html, limit=limit)
     except Exception as error:  # noqa: BLE001 — наружу отдаём текст, а не трейсбек
         return SearchResult(results=[], error=f"Не удалось получить данные 2GIS: {error}")
 
-    restaurants = parse_restaurants(html, limit=limit)
     if not restaurants:
         return SearchResult(
             results=[],
@@ -85,7 +92,7 @@ async def search_restaurants(
         )
 
     result = SearchResult(results=restaurants)
-    cache_set(NAMESPACE, cache_key, result.model_dump())
+    cache_set(namespace, cache_key, result.model_dump())
     return result
 
 
