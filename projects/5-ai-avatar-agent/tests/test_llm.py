@@ -1,6 +1,6 @@
 import json
 
-from agent import llm
+from agent import llm, skills
 
 
 class FakeToolCall:
@@ -126,6 +126,86 @@ async def test_malformed_arguments_do_not_crash():
     assert answer == "ладно"
     tool_messages = [m for m in history if isinstance(m, dict) and m.get("role") == "tool"]
     assert "error" in tool_messages[0]["content"]
+
+
+async def test_cap_reached_history_has_no_dangling_tool_calls(monkeypatch):
+    """Дефект 1: после срабатывания лимита в истории не должно оставаться
+    assistant-сообщения с tool_calls без ответа на каждый call_id — иначе
+    следующий run_turn, получив такую историю, будет отклонён API."""
+    monkeypatch.setattr(llm, "MAX_TOOL_CALLS", 2)
+    toolset = FakeToolset()
+    endless = [
+        FakeMessage(tool_calls=[FakeToolCall(str(i), "twogis__search_restaurants", {"query": "x"})])
+        for i in range(5)
+    ]
+    client = FakeClient(endless)
+    answer, history, _ = await llm.run_turn(
+        client, toolset, [], llm.build_user_message("вопрос", None)
+    )
+    assert answer == llm.CAP_REACHED_MESSAGE
+
+    answered_ids = {
+        m["tool_call_id"] for m in history if isinstance(m, dict) and m.get("role") == "tool"
+    }
+    for message in history:
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            call_id = call["id"] if isinstance(call, dict) else call.id
+            assert call_id in answered_ids, (
+                f"assistant tool_call {call_id} остался без ответа в истории"
+            )
+
+
+class FakeVisionCompletions:
+    """Заглушка client.chat.completions.parse для vision-вызова skill'а."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+
+    async def parse(self, **kwargs):
+        message = type("M", (), {"parsed": self._verdict, "refusal": None})()
+
+        class Result:
+            choices = [type("C", (), {"message": message})()]
+
+        return Result()
+
+
+class FakeClientWithVision(FakeClient):
+    """FakeClient, который умеет и chat.completions.create (агентский цикл),
+    и chat.completions.parse (внутри analyze_restaurant_photo)."""
+
+    def __init__(self, script, verdict):
+        super().__init__(script)
+        self.completions.parse = FakeVisionCompletions(verdict).parse
+
+
+async def test_local_skill_call_is_logged(tmp_path):
+    """Дефект 2: вызов локального skill analyze_restaurant_photo должен
+    попасть в возвращаемый call_log так же, как MCP-вызовы."""
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xe0test")
+    verdict = skills.RestaurantVerdict(
+        level="casual", status="семейный", description="ок", confidence=0.5
+    )
+    toolset = FakeToolset()
+    client = FakeClientWithVision(
+        [
+            FakeMessage(
+                tool_calls=[
+                    FakeToolCall("c1", "analyze_restaurant_photo", {"image_path": str(image)})
+                ]
+            ),
+            FakeMessage(content="Похоже на casual"),
+        ],
+        verdict,
+    )
+    _, _, log = await llm.run_turn(
+        client, toolset, [], llm.build_user_message("что скажешь по фото", str(image))
+    )
+    assert any(entry["name"] == "analyze_restaurant_photo" for entry in log)
 
 
 def test_trim_history_keeps_last_messages():

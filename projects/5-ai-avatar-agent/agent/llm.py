@@ -54,13 +54,30 @@ def build_user_message(text: str, image_path: str | None) -> dict:
     }
 
 
-async def _dispatch(name: str, arguments: dict, toolset: Any, client: Any) -> str:
-    """Направляет вызов в MCP или в локальный skill."""
+async def _dispatch(
+    name: str, arguments: dict, toolset: Any, client: Any, call_log: list
+) -> str:
+    """Направляет вызов в MCP или в локальный skill.
+
+    MCP-вызовы toolset регистрирует в собственном call_log сам — этот кусок
+    журнала run_turn считывает отдельно (см. срез toolset.call_log ниже).
+    Локальные skill-вызовы toolset не видит вообще, поэтому здесь они
+    записываются в call_log, принадлежащий run_turn — в той же форме
+    (name, arguments, result_size/error), чтобы UI показывал их наравне с
+    MCP-вызовами и не выглядело так, будто инструмент не вызывался.
+    """
     if toolset.handles(name):
         return await toolset.call(name, arguments)
     if name == "analyze_restaurant_photo":
         result = await analyze_restaurant_photo(arguments.get("image_path", ""), client)
-        return json.dumps(result, ensure_ascii=False)
+        payload = json.dumps(result, ensure_ascii=False)
+        if isinstance(result, dict) and "error" in result:
+            call_log.append({"name": name, "arguments": arguments, "error": result["error"]})
+        else:
+            call_log.append(
+                {"name": name, "arguments": arguments, "result_size": len(payload)}
+            )
+        return payload
     return json.dumps({"error": f"Неизвестный инструмент: {name}"}, ensure_ascii=False)
 
 
@@ -80,6 +97,7 @@ async def run_turn(
 
     tools = toolset.specs() + [ANALYZE_TOOL_SPEC]
     log_start = len(getattr(toolset, "call_log", []))
+    local_log: list = []
     calls_made = 0
     answer = ""
 
@@ -98,8 +116,27 @@ async def run_turn(
             break
 
         if calls_made >= MAX_TOOL_CALLS:
-            # Лимит проверяется на границе хода, а не внутри пачки: на каждый
-            # tool_call обязан быть ответ, иначе следующий запрос к API упадёт.
+            # Лимит достигнут: assistant-сообщение с tool_calls уже добавлено в
+            # messages, а ни один из этих вызовов ещё не обработан. Оставить их
+            # без ответа нельзя — OpenAI-совместимое API требует ровно одно
+            # tool-сообщение на каждый tool_call, иначе следующий run_turn,
+            # получив эту историю на вход, немедленно упадёт с ошибкой формата.
+            # Вырезать assistant-сообщение из истории было бы проще, но тогда
+            # стёрлось бы честное свидетельство того, что модель пыталась звать
+            # инструменты — а UI и следующий ход должны видеть, что попытка
+            # была, просто бюджет закончился. Поэтому отвечаем каждому
+            # незакрытому вызову короткой tool-заглушкой и только потом рвём цикл.
+            for call in message.tool_calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(
+                            {"error": "лимит вызовов инструментов исчерпан"},
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
             answer = CAP_REACHED_MESSAGE
             break
 
@@ -111,14 +148,18 @@ async def run_turn(
                     {"error": "аргументы пришли не в формате JSON"}, ensure_ascii=False
                 )
             else:
-                payload = await _dispatch(call.function.name, arguments, toolset, client)
+                payload = await _dispatch(call.function.name, arguments, toolset, client, local_log)
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": payload}
             )
             calls_made += 1
 
     new_history = trim_history([m for m in messages if _is_history_message(m)])
-    call_log = list(getattr(toolset, "call_log", [])[log_start:])
+    # Лог за этот ход = MCP-вызовы (их регистрирует toolset.call_log — берём
+    # только то, что появилось начиная с log_start) + локальные skill-вызовы
+    # (analyze_restaurant_photo), которые toolset не видит и не пишет к себе.
+    # toolset.call_log при этом не трогаем — это его собственный список.
+    call_log = list(getattr(toolset, "call_log", [])[log_start:]) + local_log
     return answer, new_history, call_log
 
 

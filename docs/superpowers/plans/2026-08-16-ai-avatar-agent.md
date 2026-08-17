@@ -2026,7 +2026,7 @@ git commit -m "feat(project-5): custom skill — оценка заведения
 ```python
 import json
 
-from agent import llm
+from agent import llm, skills
 
 
 class FakeToolCall:
@@ -2154,6 +2154,86 @@ async def test_malformed_arguments_do_not_crash():
     assert "error" in tool_messages[0]["content"]
 
 
+async def test_cap_reached_history_has_no_dangling_tool_calls(monkeypatch):
+    """После срабатывания лимита в истории не должно оставаться
+    assistant-сообщения с tool_calls без ответа на каждый call_id — иначе
+    следующий run_turn, получив такую историю, будет отклонён API."""
+    monkeypatch.setattr(llm, "MAX_TOOL_CALLS", 2)
+    toolset = FakeToolset()
+    endless = [
+        FakeMessage(tool_calls=[FakeToolCall(str(i), "twogis__search_restaurants", {"query": "x"})])
+        for i in range(5)
+    ]
+    client = FakeClient(endless)
+    answer, history, _ = await llm.run_turn(
+        client, toolset, [], llm.build_user_message("вопрос", None)
+    )
+    assert answer == llm.CAP_REACHED_MESSAGE
+
+    answered_ids = {
+        m["tool_call_id"] for m in history if isinstance(m, dict) and m.get("role") == "tool"
+    }
+    for message in history:
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            call_id = call["id"] if isinstance(call, dict) else call.id
+            assert call_id in answered_ids, (
+                f"assistant tool_call {call_id} остался без ответа в истории"
+            )
+
+
+class FakeVisionCompletions:
+    """Заглушка client.chat.completions.parse для vision-вызова skill'а."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+
+    async def parse(self, **kwargs):
+        message = type("M", (), {"parsed": self._verdict, "refusal": None})()
+
+        class Result:
+            choices = [type("C", (), {"message": message})()]
+
+        return Result()
+
+
+class FakeClientWithVision(FakeClient):
+    """FakeClient, который умеет и chat.completions.create (агентский цикл),
+    и chat.completions.parse (внутри analyze_restaurant_photo)."""
+
+    def __init__(self, script, verdict):
+        super().__init__(script)
+        self.completions.parse = FakeVisionCompletions(verdict).parse
+
+
+async def test_local_skill_call_is_logged(tmp_path):
+    """Вызов локального skill analyze_restaurant_photo должен попасть в
+    возвращаемый call_log так же, как MCP-вызовы."""
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xe0test")
+    verdict = skills.RestaurantVerdict(
+        level="casual", status="семейный", description="ок", confidence=0.5
+    )
+    toolset = FakeToolset()
+    client = FakeClientWithVision(
+        [
+            FakeMessage(
+                tool_calls=[
+                    FakeToolCall("c1", "analyze_restaurant_photo", {"image_path": str(image)})
+                ]
+            ),
+            FakeMessage(content="Похоже на casual"),
+        ],
+        verdict,
+    )
+    _, _, log = await llm.run_turn(
+        client, toolset, [], llm.build_user_message("что скажешь по фото", str(image))
+    )
+    assert any(entry["name"] == "analyze_restaurant_photo" for entry in log)
+
+
 def test_trim_history_keeps_last_messages():
     messages = [{"role": "user", "content": str(i)} for i in range(30)]
     trimmed = llm.trim_history(messages, limit=10)
@@ -2235,13 +2315,30 @@ def build_user_message(text: str, image_path: str | None) -> dict:
     }
 
 
-async def _dispatch(name: str, arguments: dict, toolset: Any, client: Any) -> str:
-    """Направляет вызов в MCP или в локальный skill."""
+async def _dispatch(
+    name: str, arguments: dict, toolset: Any, client: Any, call_log: list
+) -> str:
+    """Направляет вызов в MCP или в локальный skill.
+
+    MCP-вызовы toolset регистрирует в собственном call_log сам — этот кусок
+    журнала run_turn считывает отдельно (см. срез toolset.call_log ниже).
+    Локальные skill-вызовы toolset не видит вообще, поэтому здесь они
+    записываются в call_log, принадлежащий run_turn — в той же форме
+    (name, arguments, result_size/error), чтобы UI показывал их наравне с
+    MCP-вызовами и не выглядело так, будто инструмент не вызывался.
+    """
     if toolset.handles(name):
         return await toolset.call(name, arguments)
     if name == "analyze_restaurant_photo":
         result = await analyze_restaurant_photo(arguments.get("image_path", ""), client)
-        return json.dumps(result, ensure_ascii=False)
+        payload = json.dumps(result, ensure_ascii=False)
+        if isinstance(result, dict) and "error" in result:
+            call_log.append({"name": name, "arguments": arguments, "error": result["error"]})
+        else:
+            call_log.append(
+                {"name": name, "arguments": arguments, "result_size": len(payload)}
+            )
+        return payload
     return json.dumps({"error": f"Неизвестный инструмент: {name}"}, ensure_ascii=False)
 
 
@@ -2261,6 +2358,7 @@ async def run_turn(
 
     tools = toolset.specs() + [ANALYZE_TOOL_SPEC]
     log_start = len(getattr(toolset, "call_log", []))
+    local_log: list = []
     calls_made = 0
     answer = ""
 
@@ -2279,8 +2377,27 @@ async def run_turn(
             break
 
         if calls_made >= MAX_TOOL_CALLS:
-            # Лимит проверяется на границе хода, а не внутри пачки: на каждый
-            # tool_call обязан быть ответ, иначе следующий запрос к API упадёт.
+            # Лимит достигнут: assistant-сообщение с tool_calls уже добавлено в
+            # messages, а ни один из этих вызовов ещё не обработан. Оставить их
+            # без ответа нельзя — OpenAI-совместимое API требует ровно одно
+            # tool-сообщение на каждый tool_call, иначе следующий run_turn,
+            # получив эту историю на вход, немедленно упадёт с ошибкой формата.
+            # Вырезать assistant-сообщение из истории было бы проще, но тогда
+            # стёрлось бы честное свидетельство того, что модель пыталась звать
+            # инструменты — а UI и следующий ход должны видеть, что попытка
+            # была, просто бюджет закончился. Поэтому отвечаем каждому
+            # незакрытому вызову короткой tool-заглушкой и только потом рвём цикл.
+            for call in message.tool_calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(
+                            {"error": "лимит вызовов инструментов исчерпан"},
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
             answer = CAP_REACHED_MESSAGE
             break
 
@@ -2292,14 +2409,18 @@ async def run_turn(
                     {"error": "аргументы пришли не в формате JSON"}, ensure_ascii=False
                 )
             else:
-                payload = await _dispatch(call.function.name, arguments, toolset, client)
+                payload = await _dispatch(call.function.name, arguments, toolset, client, local_log)
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": payload}
             )
             calls_made += 1
 
     new_history = trim_history([m for m in messages if _is_history_message(m)])
-    call_log = list(getattr(toolset, "call_log", [])[log_start:])
+    # Лог за этот ход = MCP-вызовы (их регистрирует toolset.call_log — берём
+    # только то, что появилось начиная с log_start) + локальные skill-вызовы
+    # (analyze_restaurant_photo), которые toolset не видит и не пишет к себе.
+    # toolset.call_log при этом не трогаем — это его собственный список.
+    call_log = list(getattr(toolset, "call_log", [])[log_start:]) + local_log
     return answer, new_history, call_log
 
 
@@ -2313,7 +2434,7 @@ def _is_history_message(message: Any) -> bool:
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_llm.py -v`
-Expected: PASS, 7 passed.
+Expected: PASS, 9 passed.
 
 - [ ] **Step 5: Коммит**
 
