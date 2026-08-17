@@ -88,21 +88,32 @@ def total_spent() -> float:
     return round(total, 2)
 
 
-async def run_model(model: str, arguments: dict, mock_result: dict) -> dict:
-    """Вызывает модель fal или возвращает заглушку, если включён mock-режим."""
+async def run_model(model: str, arguments: dict, mock_result: dict, attempts: int = 2) -> dict:
+    """Вызывает модель fal или возвращает заглушку, если включён mock-режим.
+
+    ``attempts`` — сколько раз пробовать до того, как поднять исключение.
+    По умолчанию 2 (одна повторная попытка), чтобы поведение всех
+    существующих вызовов не изменилось. Для дорогих моделей (например,
+    генерация видео, ~$1 за прогон) имеет смысл передавать ``attempts=1``:
+    повторная попытка там стоит дороже, чем экономит — при отказе дешевле
+    один раз упасть и разобраться руками, чем молча заплатить ещё раз.
+    """
+    if attempts < 1:
+        raise ValueError(f"attempts должен быть не меньше 1, получено {attempts}")
+
     if FAL_MOCK:
         print(f"🧪 mock: {model} (реальный вызов не выполнен)")
         return mock_result
 
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(attempts):
         try:
             result = await fal_client.subscribe_async(model, arguments=arguments)
             record_cost(model)
             return result
         except Exception as error:  # noqa: BLE001
             last_error = error
-            if attempt == 0:
+            if attempt < attempts - 1:
                 await asyncio.sleep(2)
     raise RuntimeError(f"fal не ответил ({model}): {last_error}")
 

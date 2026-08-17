@@ -34,6 +34,12 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
     audio_url = await falcost.upload(audio_path)
     mock = {"video": {"url": "https://mock.local/avatar.mp4"}}
 
+    # attempts=1 для обеих моделей: видео — самая дорогая операция в проекте
+    # (~$1 за прогон при бюджете ~$15-20), а на этот вызов уже есть свой
+    # fallback на вторую модель. Штатный retry falcost.run_model (attempts=2)
+    # умножил бы худший случай до 4 платных попыток за один generate_video();
+    # с attempts=1 на каждом шаге худший случай — 2 (по одной на модель). Не
+    # "чинить" это обратно на attempts=2 — тут это осознанный анти-ретрай.
     try:
         result = await falcost.run_model(
             AVATAR_MODEL,
@@ -46,6 +52,7 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
                 "resolution": "720p",
             },
             mock_result=mock,
+            attempts=1,
         )
     except Exception as error:  # noqa: BLE001 — падение Aurora не должно стоить нам демо
         print(f"⚠️  {AVATAR_MODEL} не отработала ({error}), пробую {AVATAR_FALLBACK_MODEL}")
@@ -53,6 +60,7 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
             AVATAR_FALLBACK_MODEL,
             {"image_url": image_url, "audio_url": audio_url},
             mock_result=mock,
+            attempts=1,
         )
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

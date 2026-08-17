@@ -56,6 +56,70 @@ async def test_failure_retries_then_raises(monkeypatch, tmp_path):
     assert len(attempts) == 2
 
 
+async def test_attempts_one_makes_single_attempt_then_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    attempts = []
+
+    async def flaky(model, arguments=None, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("fal недоступен")
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(falcost.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", flaky)
+    try:
+        await falcost.run_model("fal-ai/creatify/aurora", {}, {"video": "x"}, attempts=1)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("должно было упасть")
+    assert len(attempts) == 1
+
+
+async def test_attempts_default_still_makes_two(monkeypatch, tmp_path):
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    attempts = []
+
+    async def flaky(model, arguments=None, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("fal недоступен")
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(falcost.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", flaky)
+    try:
+        await falcost.run_model("fal-ai/whisper", {}, {"text": "x"})
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("должно было упасть")
+    assert len(attempts) == 2
+
+
+async def test_attempts_zero_or_negative_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("attempts<1 должен быть отклонён раньше сетевого вызова")
+
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", explode)
+
+    for bad_value in (0, -1):
+        try:
+            await falcost.run_model("fal-ai/whisper", {}, {"text": "x"}, attempts=bad_value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"attempts={bad_value} должен был быть отклонён")
+
+
 def test_total_spent_sums_log(monkeypatch, tmp_path):
     log = tmp_path / "costs.jsonl"
     monkeypatch.setattr(falcost, "COST_LOG", log)

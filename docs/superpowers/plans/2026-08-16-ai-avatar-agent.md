@@ -2607,7 +2607,7 @@ git commit -m "feat(project-5): цикл tool calling с памятью и по�
 
 **Interfaces:**
 - Consumes: `config.FAL_MOCK`, `config.CACHE_DIR`, `config.OUTPUT_DIR`.
-- Produces: `falcost.PRICES: dict[str, float]`, `async falcost.run_model(model: str, arguments: dict, mock_result: dict) -> dict`, `async falcost.upload(path: str) -> str`, `falcost.record_cost(model: str) -> None`, `falcost.total_spent() -> float`, `falcost.download(url: str, target: Path) -> Path`.
+- Produces: `falcost.PRICES: dict[str, float]`, `async falcost.run_model(model: str, arguments: dict, mock_result: dict, attempts: int = 2) -> dict`, `async falcost.upload(path: str) -> str`, `falcost.record_cost(model: str) -> None`, `falcost.total_spent() -> float`, `falcost.download(url: str, target: Path) -> Path`.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -2670,6 +2670,71 @@ async def test_failure_retries_then_raises(monkeypatch, tmp_path):
     else:
         raise AssertionError("должно было упасть")
     assert len(attempts) == 2
+
+
+async def test_attempts_one_makes_single_attempt_then_raises(monkeypatch, tmp_path):
+    """Дорогие модели (видео) не должны платить за штатный retry."""
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    attempts = []
+
+    async def flaky(model, arguments=None, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("fal недоступен")
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(falcost.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", flaky)
+    try:
+        await falcost.run_model("fal-ai/creatify/aurora", {}, {"video": "x"}, attempts=1)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("должно было упасть")
+    assert len(attempts) == 1
+
+
+async def test_attempts_default_still_makes_two(monkeypatch, tmp_path):
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    attempts = []
+
+    async def flaky(model, arguments=None, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("fal недоступен")
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(falcost.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", flaky)
+    try:
+        await falcost.run_model("fal-ai/whisper", {}, {"text": "x"})
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("должно было упасть")
+    assert len(attempts) == 2
+
+
+async def test_attempts_zero_or_negative_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("attempts<1 должен быть отклонён раньше сетевого вызова")
+
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", explode)
+
+    for bad_value in (0, -1):
+        try:
+            await falcost.run_model("fal-ai/whisper", {}, {"text": "x"}, attempts=bad_value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"attempts={bad_value} должен был быть отклонён")
 
 
 def test_total_spent_sums_log(monkeypatch, tmp_path):
@@ -2874,21 +2939,32 @@ def total_spent() -> float:
     return round(total, 2)
 
 
-async def run_model(model: str, arguments: dict, mock_result: dict) -> dict:
-    """Вызывает модель fal или возвращает заглушку, если включён mock-режим."""
+async def run_model(model: str, arguments: dict, mock_result: dict, attempts: int = 2) -> dict:
+    """Вызывает модель fal или возвращает заглушку, если включён mock-режим.
+
+    ``attempts`` — сколько раз пробовать до того, как поднять исключение.
+    По умолчанию 2 (одна повторная попытка), чтобы поведение всех
+    существующих вызовов не изменилось. Для дорогих моделей (например,
+    генерация видео, ~$1 за прогон) имеет смысл передавать ``attempts=1``:
+    повторная попытка там стоит дороже, чем экономит — при отказе дешевле
+    один раз упасть и разобраться руками, чем молча заплатить ещё раз.
+    """
+    if attempts < 1:
+        raise ValueError(f"attempts должен быть не меньше 1, получено {attempts}")
+
     if FAL_MOCK:
         print(f"🧪 mock: {model} (реальный вызов не выполнен)")
         return mock_result
 
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(attempts):
         try:
             result = await fal_client.subscribe_async(model, arguments=arguments)
             record_cost(model)
             return result
         except Exception as error:  # noqa: BLE001
             last_error = error
-            if attempt == 0:
+            if attempt < attempts - 1:
                 await asyncio.sleep(2)
     raise RuntimeError(f"fal не ответил ({model}): {last_error}")
 
@@ -2929,7 +3005,7 @@ def download(url: str, target: Path) -> Path:
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_falcost.py -v`
-Expected: PASS, 10 passed.
+Expected: PASS, 13 passed.
 
 - [ ] **Step 5: Коммит**
 
@@ -3197,9 +3273,10 @@ async def test_uses_aurora_with_spec_parameters(tmp_path, monkeypatch):
     async def fake_upload(path):
         return f"https://mock/{Path(path).name}"
 
-    async def fake_run(model, arguments, mock_result):
+    async def fake_run(model, arguments, mock_result, attempts=2):
         seen["model"] = model
         seen["arguments"] = arguments
+        seen["attempts"] = attempts
         return {"video": {"url": "https://mock/v.mp4"}}
 
     monkeypatch.setattr(generate.falcost, "upload", fake_upload)
@@ -3212,6 +3289,7 @@ async def test_uses_aurora_with_spec_parameters(tmp_path, monkeypatch):
     assert seen["arguments"]["guidance_scale"] == 1
     assert seen["arguments"]["audio_guidance_scale"] == 2
     assert seen["arguments"]["resolution"] == "720p"
+    assert seen["attempts"] == 1
 
 
 async def test_falls_back_to_kling_when_aurora_fails(tmp_path, monkeypatch):
@@ -3220,12 +3298,14 @@ async def test_falls_back_to_kling_when_aurora_fails(tmp_path, monkeypatch):
     audio = tmp_path / "a.mp3"
     audio.write_bytes(b"mp3")
     models = []
+    attempts_seen = []
 
     async def fake_upload(path):
         return "https://mock/file"
 
-    async def fake_run(model, arguments, mock_result):
+    async def fake_run(model, arguments, mock_result, attempts=2):
         models.append(model)
+        attempts_seen.append(attempts)
         if model == "fal-ai/creatify/aurora":
             raise RuntimeError("aurora недоступна")
         return {"video": {"url": "https://mock/v.mp4"}}
@@ -3237,6 +3317,42 @@ async def test_falls_back_to_kling_when_aurora_fails(tmp_path, monkeypatch):
 
     await generate.generate_video(str(audio), str(photo))
     assert models == ["fal-ai/creatify/aurora", "fal-ai/kling-video/ai-avatar/v2/standard"]
+    assert attempts_seen == [1, 1]
+
+
+async def test_both_models_failing_costs_exactly_two_paid_invocations(tmp_path, monkeypatch):
+    """Бюджетная гарантия: худший случай generate_video() — 2 платных вызова.
+
+    Даже если и основная модель, и fallback падают, каждая должна быть
+    вызвана ровно один раз (attempts=1), а не по два раза каждая (как было
+    бы со штатным retry falcost.run_model). Иначе один неудачный прогон мог
+    бы стоить до 4 платных попыток при бюджете проекта ~$15-20.
+    """
+    photo = tmp_path / "me.jpg"
+    photo.write_bytes(b"jpg")
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"mp3")
+    invocations = []
+
+    async def fake_upload(path):
+        return "https://mock/file"
+
+    async def fake_run(model, arguments, mock_result, attempts=2):
+        invocations.append((model, attempts))
+        raise RuntimeError(f"{model} недоступна")
+
+    monkeypatch.setattr(generate.falcost, "upload", fake_upload)
+    monkeypatch.setattr(generate.falcost, "run_model", fake_run)
+    monkeypatch.setattr(generate, "OUTPUT_DIR", tmp_path)
+
+    with pytest.raises(RuntimeError):
+        await generate.generate_video(str(audio), str(photo))
+
+    assert len(invocations) == 2
+    assert invocations == [
+        ("fal-ai/creatify/aurora", 1),
+        ("fal-ai/kling-video/ai-avatar/v2/standard", 1),
+    ]
 
 
 async def test_missing_photo_raises_with_helpful_message(tmp_path, monkeypatch):
@@ -3295,6 +3411,12 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
     audio_url = await falcost.upload(audio_path)
     mock = {"video": {"url": "https://mock.local/avatar.mp4"}}
 
+    # attempts=1 для обеих моделей: видео — самая дорогая операция в проекте
+    # (~$1 за прогон при бюджете ~$15-20), а на этот вызов уже есть свой
+    # fallback на вторую модель. Штатный retry falcost.run_model (attempts=2)
+    # умножил бы худший случай до 4 платных попыток за один generate_video();
+    # с attempts=1 на каждом шаге худший случай — 2 (по одной на модель). Не
+    # "чинить" это обратно на attempts=2 — тут это осознанный анти-ретрай.
     try:
         result = await falcost.run_model(
             AVATAR_MODEL,
@@ -3307,6 +3429,7 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
                 "resolution": "720p",
             },
             mock_result=mock,
+            attempts=1,
         )
     except Exception as error:  # noqa: BLE001 — падение Aurora не должно стоить нам демо
         print(f"⚠️  {AVATAR_MODEL} не отработала ({error}), пробую {AVATAR_FALLBACK_MODEL}")
@@ -3314,6 +3437,7 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
             AVATAR_FALLBACK_MODEL,
             {"image_url": image_url, "audio_url": audio_url},
             mock_result=mock,
+            attempts=1,
         )
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -3324,7 +3448,7 @@ async def generate_video(audio_path: str, photo_path: str | None = None) -> Path
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_avatar.py -v`
-Expected: PASS, 3 passed.
+Expected: PASS, 4 passed.
 
 - [ ] **Step 5: Коммит**
 
