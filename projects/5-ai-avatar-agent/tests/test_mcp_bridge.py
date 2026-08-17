@@ -89,11 +89,16 @@ def test_handles_only_known_prefixes():
     assert toolset.handles("analyze_restaurant_photo") is False
 
 
-async def test_open_cleans_up_on_partial_failure():
+async def test_open_cleans_up_on_partial_failure(monkeypatch):
     """Проверяет, что open() закрывает уже открытые клиенты, если произойдёт ошибка.
 
     Если второй сервер не откроется или list_tools() упадёт, первый сервер должен
     быть закрыт, внутреннее состояние очищено, и можно будет вызвать open() снова.
+
+    Чтобы тест реально доказывал закрытие клиента (а не просто проверял приватное
+    состояние, которое можно случайно очистить и без вызова __aexit__), подменяем
+    mcp_bridge.Client шпионом, который считает вызовы __aexit__ на каждом созданном
+    экземпляре.
     """
     first_server = FastMCP("first")
 
@@ -109,11 +114,6 @@ async def test_open_cleans_up_on_partial_failure():
         """Нельзя даже перечислить этот инструмент."""
         return Answer(text="this tool should never be callable")
 
-    # Создаём переменную для отслеживания
-    call_count = {"count": 0}
-
-    original_list_tools = second_server.list_tools
-
     async def failing_list_tools():
         """list_tools() падает для второго сервера."""
         raise RuntimeError(
@@ -121,6 +121,23 @@ async def test_open_cleans_up_on_partial_failure():
         )
 
     second_server.list_tools = failing_list_tools
+
+    # Шпион поверх реального Client: считает, сколько раз вызвали __aexit__
+    # у каждого созданного экземпляра, и регистрирует все экземпляры по порядку.
+    created_clients: list[mcp_bridge.Client] = []
+    real_client_cls = mcp_bridge.Client
+
+    class SpyingClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.aexit_calls = 0
+            created_clients.append(self)
+
+        async def __aexit__(self, *args):
+            self.aexit_calls += 1
+            return await super().__aexit__(*args)
+
+    monkeypatch.setattr(mcp_bridge, "Client", SpyingClient)
 
     # Создаём toolset с двумя серверами
     toolset = mcp_bridge.McpToolset({"first": first_server, "second": second_server})
@@ -131,6 +148,19 @@ async def test_open_cleans_up_on_partial_failure():
     ):
         await toolset.open()
 
+    # Оба клиента успели открыться (__aenter__ у второго тоже отрабатывает —
+    # падает именно list_tools()), поэтому оба должны быть закрыты в except-блоке.
+    assert len(created_clients) == 2
+    first_client, second_client = created_clients
+    assert first_client.aexit_calls == 1, (
+        "клиент первого сервера должен быть закрыт (__aexit__ вызван), "
+        "иначе его подпроцесс останется висеть"
+    )
+    assert second_client.aexit_calls == 1, (
+        "клиент второго сервера тоже должен быть закрыт (__aenter__ у него "
+        "успел отработать до падения list_tools())"
+    )
+
     # Проверяем, что specs() пуста (нет половинчатых инструментов)
     assert toolset.specs() == [], "specs() должна быть пуста после ошибки open()"
 
@@ -138,7 +168,7 @@ async def test_open_cleans_up_on_partial_failure():
     assert len(toolset._clients) == 0, "_clients должна быть пуста после ошибки open()"
 
     # После ошибки должно быть безопасно вызвать open() снова без ошибок состояния
-    # (это доказывает, что ресурсы первого сервера были надлежащим образом освобождены)
+    monkeypatch.undo()
     toolset2 = mcp_bridge.McpToolset({"first": first_server})
     await toolset2.open()
     try:
