@@ -79,8 +79,18 @@ class BrowserPool:
                 await asyncio.sleep(THROTTLE_SECONDS - elapsed)
             self._last_navigation = time.monotonic()
 
-    async def fetch_html(self, url: str, wait_selector: str) -> str:
-        """Открывает страницу и возвращает её HTML после появления нужного блока."""
+    async def fetch_html(
+        self,
+        url: str,
+        wait_selector: str,
+        cookies: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Открывает страницу и возвращает её HTML после появления нужного блока.
+
+        `cookies` позволяет предустановить куки перед первой навигацией — например,
+        чтобы сразу пропустить заглушку-интерстишл сайта («обновите браузер» у
+        2ГИС), которая иначе перекрывает реальный контент на первой загрузке.
+        """
         await self.start()
         await self._throttle()
         assert self._browser is not None
@@ -91,6 +101,8 @@ class BrowserPool:
             viewport={"width": 1280, "height": 900},
         )
         try:
+            if cookies:
+                await context.add_cookies(cookies)
             page = await context.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
             try:
