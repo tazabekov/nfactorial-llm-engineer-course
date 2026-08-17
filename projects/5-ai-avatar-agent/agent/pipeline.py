@@ -23,11 +23,31 @@ SERVER_PATHS: dict[str, str] = {
 }
 
 
+class _LazyOpenAIClient:
+    """Ленивая обёртка над AsyncOpenAI.
+
+    Конструктор AsyncOpenAI() падает с OpenAIError, если OPENAI_API_KEY не
+    задан в окружении. Поэтому настоящий клиент создаётся не при создании
+    обёртки, а только при первом обращении к его атрибуту (методу) — ровно
+    в момент, когда он реально нужен для похода в API. До этого момента
+    объект можно свободно передавать по цепочке вызовов, ничего не требуя
+    от окружения. Построенный клиент кешируется и переиспользуется.
+    """
+
+    def __init__(self) -> None:
+        self._client: AsyncOpenAI | None = None
+
+    def __getattr__(self, name: str):
+        if self._client is None:
+            self._client = AsyncOpenAI()
+        return getattr(self._client, name)
+
+
 class Agent:
     """Живёт всё время работы приложения: держит MCP-серверы поднятыми."""
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI()
+        self._client = _LazyOpenAIClient()
         self._toolset: McpToolset | None = None
 
     async def start(self) -> None:

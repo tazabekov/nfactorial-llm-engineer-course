@@ -20,6 +20,7 @@
 - Модель аватара: `fal-ai/creatify/aurora` с `guidance_scale: 1`, `audio_guidance_scale: 2`, `resolution: "720p"`. Запасная: `fal-ai/kling-video/ai-avatar/v2/standard`.
 - Модели fal: ASR `fal-ai/whisper`, клон голоса `fal-ai/minimax/voice-clone` (возвращает **`custom_voice_id`**), TTS `fal-ai/minimax/speech-02-hd` (голос передаётся вложенным **`voice_setting`**).
 - **Ни один тест не ходит в сеть и не тратит деньги.** Всё внешнее — за интерфейсами, в тестах подменяется.
+- **Весь набор тестов проходит без единого API-ключа в окружении.** Конструирование любых клиентов внешних API (в т.ч. `AsyncOpenAI` в `agent/pipeline.py`) должно быть ленивым — не в `__init__`, а при первом реальном обращении к клиенту. Проверяется явно: `cd projects/5-ai-avatar-agent && env -u OPENAI_API_KEY -u FAL_KEY .venv/bin/pytest -v`.
 - Все платные вызовы fal (клон голоса, TTS, видео) в режиме `FAL_MOCK=1` возвращают заглушки. `FAL_MOCK=1` — значение по умолчанию в разработке; реальные вызовы включаются явно.
 - Комментарии, докстринги и текст интерфейса — на русском, как и везде в репозитории.
 - Коммиты в стиле репозитория: `feat(project-5): ...`, `test(project-5): ...`, `docs(project-5): ...`.
@@ -3611,11 +3612,31 @@ SERVER_PATHS: dict[str, str] = {
 }
 
 
+class _LazyOpenAIClient:
+    """Ленивая обёртка над AsyncOpenAI.
+
+    Конструктор AsyncOpenAI() падает с OpenAIError, если OPENAI_API_KEY не
+    задан в окружении. Поэтому настоящий клиент создаётся не при создании
+    обёртки, а только при первом обращении к его атрибуту (методу) — ровно
+    в момент, когда он реально нужен для похода в API. До этого момента
+    объект можно свободно передавать по цепочке вызовов, ничего не требуя
+    от окружения. Построенный клиент кешируется и переиспользуется.
+    """
+
+    def __init__(self) -> None:
+        self._client: AsyncOpenAI | None = None
+
+    def __getattr__(self, name: str):
+        if self._client is None:
+            self._client = AsyncOpenAI()
+        return getattr(self._client, name)
+
+
 class Agent:
     """Живёт всё время работы приложения: держит MCP-серверы поднятыми."""
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI()
+        self._client = _LazyOpenAIClient()
         self._toolset: McpToolset | None = None
 
     async def start(self) -> None:
@@ -3684,7 +3705,7 @@ class Agent:
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_pipeline.py -v`
-Expected: PASS, 5 passed.
+Expected: PASS, 8 passed.
 
 - [ ] **Step 5: Прогнать весь набор тестов**
 

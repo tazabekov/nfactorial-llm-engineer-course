@@ -98,3 +98,29 @@ async def test_make_video_delegates(monkeypatch, tmp_path):
 def test_server_paths_point_to_existing_files():
     for path in pipeline.SERVER_PATHS.values():
         assert Path(path).exists()
+
+
+def test_agent_construction_without_api_key(monkeypatch):
+    """Agent() не должен трогать окружение: ключ может отсутствовать."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    pipeline.Agent()
+
+
+async def test_client_created_once_and_reused(monkeypatch):
+    """Ленивый клиент собирается один раз (при первом обращении к атрибуту)
+    и переиспользуется между вызовами."""
+    created = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            created.append(1)
+            self.marker = "fake"
+
+    monkeypatch.setattr(pipeline, "AsyncOpenAI", FakeClient)
+    agent = pipeline.Agent()
+
+    first = agent._client.marker
+    second = agent._client.marker
+
+    assert len(created) == 1
+    assert first == second == "fake"
