@@ -920,16 +920,16 @@ async def test_tool_is_exposed_with_expected_name():
 async def test_offline_mode_returns_results_from_fixture(monkeypatch):
     monkeypatch.setattr(server, "OFFLINE", True)
     async with Client(server.mcp) as client:
-        result = await client.call_tool("search_restaurants", {"query": "рестораны"})
-    assert result.data["error"] == ""
-    assert len(result.data["results"]) >= 3
+        result = await client.call_tool("search_restaurants", {"query": "рестораны-офлайн-тест"})
+    assert result.data.error == ""
+    assert len(result.data.results) >= 3
 
 
 async def test_cache_prevents_second_fetch(monkeypatch):
     monkeypatch.setattr(server, "OFFLINE", False)
     calls = []
 
-    async def fake_fetch(url, selector):
+    async def fake_fetch(url, selector, cookies=None):
         calls.append(url)
         return (server.FIXTURES_DIR / "twogis_search.html").read_text(encoding="utf-8")
 
@@ -938,22 +938,28 @@ async def test_cache_prevents_second_fetch(monkeypatch):
         first = await client.call_tool("search_restaurants", {"query": "уник-запрос-кэш"})
         second = await client.call_tool("search_restaurants", {"query": "уник-запрос-кэш"})
     assert len(calls) == 1
-    assert first.data["cached"] is False
-    assert second.data["cached"] is True
+    assert first.data.cached is False
+    assert second.data.cached is True
 
 
 async def test_parser_failure_yields_error_and_no_results(monkeypatch):
     monkeypatch.setattr(server, "OFFLINE", False)
 
-    async def broken_fetch(url, selector):
+    async def broken_fetch(url, selector, cookies=None):
         raise RuntimeError("сайт недоступен")
 
     monkeypatch.setattr(server.POOL, "fetch_html", broken_fetch)
     async with Client(server.mcp) as client:
         result = await client.call_tool("search_restaurants", {"query": "что-то новое"})
-    assert result.data["results"] == []
-    assert "недоступен" in result.data["error"]
+    assert result.data.results == []
+    assert "недоступен" in result.data.error
 ```
+
+> **Примечание (по факту реализации):** `result.data` в fastmcp 3.4.7 — это
+> гидратированный pydantic-подобный объект (`Root`), а не `dict`, поэтому
+> доступ к полям идёт через атрибуты (`result.data.error`), а не через
+> `result.data["error"]`. Сигнатура `fetch_html` также получила `cookies`
+> (см. Step 3) — фейковые фетчеры в тестах должны принимать этот параметр.
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
 
@@ -998,6 +1004,14 @@ POOL = BrowserPool()
 CARD_WAIT_SELECTOR = "a[href*='/firm/']"
 NAMESPACE = "twogis"
 
+# 2ГИС перед реальным контентом показывает интерстишл «обновите браузер» —
+# он пропадает, если заранее подставить эту куку (так делает и обычный клик
+# по кнопке «Пропустить»). Без неё headless-браузер получает только заглушку
+# на ~11 КБ вместо страницы поиска, и парсер не находит ни одной карточки.
+# Та же кука используется в tools/capture_fixture.py, где приём был найден
+# и проверен на живом сайте.
+_TWOGIS_COOKIES = [{"name": "dg5_museum_accept", "value": "true", "domain": "2gis.kz", "path": "/"}]
+
 
 def _offline_html() -> str:
     return (FIXTURES_DIR / "twogis_search.html").read_text(encoding="utf-8")
@@ -1030,7 +1044,9 @@ async def search_restaurants(
             html = _offline_html()
         else:
             url = build_search_url(query, "almaty")
-            html = await with_retry(lambda: POOL.fetch_html(url, CARD_WAIT_SELECTOR))
+            html = await with_retry(
+                lambda: POOL.fetch_html(url, CARD_WAIT_SELECTOR, cookies=_TWOGIS_COOKIES)
+            )
     except Exception as error:  # noqa: BLE001 — наружу отдаём текст, а не трейсбек
         return SearchResult(results=[], error=f"Не удалось получить данные 2GIS: {error}")
 
@@ -1068,7 +1084,7 @@ async def main():
         tools = await client.list_tools()
         print('инструменты:', [t.name for t in tools])
         result = await client.call_tool('search_restaurants', {'query': 'рестораны'})
-        print('найдено:', len(result.data['results']))
+        print('найдено:', len(result.data.results))
 
 asyncio.run(main())
 "
