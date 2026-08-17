@@ -1475,7 +1475,23 @@ if __name__ == "__main__":
 - [ ] **Step 6: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_chocolife.py -v`
-Expected: PASS, 7 passed. Если парсинг-тесты падают — править селекторы под фикстуру.
+Expected: PASS, 9 passed (после исправления в раунде 1 ниже — было 7, добавлены
+два теста на fallback). Если парсинг-тесты падают — править селекторы под
+фикстуру.
+
+> **Примечание (исправление, раунд 1, 2026-08-17):** первая реализация Task 6
+> отклонилась от этого плана — `CATALOG_URL` указывал на главную страницу
+> chocolife.me вместо категории `/restorany-kafe-i-bary/`, потому что
+> категория отдаёт всего 2 живые акции, а не ≥3, под которые был написан
+> тест. Это было исправлено обратно на план: `CATALOG_URL` снова —
+> `/restorany-kafe-i-bary/`, фикстура переснята с этой страницы (2 живые
+> акции подтверждены вручную — DOM-разметка `div.deal`, TransferState JSON
+> в HTML не найден), порог теста снижен до `>= 2` с явным комментарием,
+> почему это не регресс. Дополнительно добавлен явный fallback на главную
+> страницу на случай, если категория отдаст 0 акций — но только с пометкой
+> в `DealsResult.source`, чтобы агент/пользователь могли отличить
+> ресторанные скидки от общей подборки. Подробности и живой прогон — в
+> `.superpowers/sdd/task-6-report.md`, раздел "Fix round 1".
 
 - [ ] **Step 7: Написать README сервера и закоммитить**
 
@@ -1502,8 +1518,13 @@ Expected: PASS, 7 passed. Если парсинг-тесты падают — п
 
 **Обновить фикстуру при поломке селекторов:**
 
-    .venv/bin/python tools/capture_fixture.py "https://chocolife.me/restorany-kafe-i-bary/" chocolife_deals.html "a[href*='deal']"
+    .venv/bin/python tools/capture_fixture.py "https://chocolife.me/restorany-kafe-i-bary/" chocolife_deals.html "cl-deal"
 ```
+
+> **Примечание (раунд 1):** актуальный README (см. отчёт по исправлению)
+> дополнительно фиксирует находку "категория и правда маленькая" (2 живые
+> акции на момент съёмки) и документирует явный fallback на главную с
+> пометкой в `source` — оба пункта в этом плане изначально не были описаны.
 
 ```bash
 git add projects/5-ai-avatar-agent/mcp_servers/chocolife projects/5-ai-avatar-agent/tests/test_chocolife.py \
