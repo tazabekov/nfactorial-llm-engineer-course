@@ -63,9 +63,33 @@ async def on_send(text, audio, image, history, agent):
     # Фейковые (и некоторые реальные) реализации агента могут не класть
     # реплику пользователя в возвращаемую историю сами — гарантируем, что
     # в диалоге виден и вопрос, и ответ, а не только ответ.
+    #
+    # Раньше решение "добавлять или нет" принималось по тому, является ли
+    # ПЕРВОЕ отображаемое сообщение репликой пользователя. Это ломалось на
+    # длинных сессиях: после того как trim_history (agent/llm.py) обрезает
+    # историю по MAX_HISTORY_MESSAGES, первым отображаемым сообщением может
+    # оказаться ответ ассистента на более ранний, уже не показываемый ход —
+    # хотя текущий вопрос пользователя уже присутствует в history дальше.
+    # Guard срабатывал и подставлял текущий вопрос ещё раз, в начало чата,
+    # хотя он уже корректно стоял внизу — пользователь видел вопрос дважды.
+    #
+    # Теперь проверяем содержимое, а не позицию: если текущий вопрос уже
+    # встречается среди реплик пользователя в display — ничего не делаем.
+    # Если нет (как в тестовом двойнике, который не кладёт реплику
+    # пользователя в историю сам) — вставляем его на правильное по смыслу
+    # место: непосредственно перед ответом ассистента на этот вопрос, а не
+    # в начало диалога.
     question = result.get("question") or text or ""
-    if question and (not display or display[0]["role"] != "user"):
-        display = [{"role": "user", "content": question}] + display
+    if question:
+        already_shown = any(
+            message["role"] == "user" and message["content"] == question
+            for message in display
+        )
+        if not already_shown:
+            if display and display[-1]["role"] == "assistant":
+                display = display[:-1] + [{"role": "user", "content": question}] + display[-1:]
+            else:
+                display = display + [{"role": "user", "content": question}]
 
     return "", display, chat, format_tool_log(result["tool_log"])
 

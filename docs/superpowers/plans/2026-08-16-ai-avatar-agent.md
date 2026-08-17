@@ -3849,22 +3849,14 @@ def format_tool_log(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def on_send(text, audio, image, history, agent):
-    """Обрабатывает отправку сообщения: возвращает очищенное поле, чат, историю и лог."""
-    try:
-        result = await agent.ask(text or "", audio, image, history)
-    except Exception as error:  # noqa: BLE001
-        raise gr.Error(f"Агент не смог ответить: {error}") from error
-
-    chat = result["history"]
-    display = [
-        message for message in _as_display_messages(chat)
-    ]
-    return "", display, chat, format_tool_log(result["tool_log"])
-
-
 def _as_display_messages(history: list) -> list[dict]:
-    """Оставляет для чата только реплики пользователя и ассистента."""
+    """Оставляет для чата только реплики пользователя и ассистента.
+
+    Записи истории бывают двух форм: сообщения пользователя и инструментов —
+    обычные словари, а ответы ассистента — сырые объекты OpenAI SDK
+    (атрибуты, не ключи), поэтому доступ к роли и содержимому — с оглядкой
+    на обе формы.
+    """
     display: list[dict] = []
     for message in history:
         role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
@@ -3877,6 +3869,50 @@ def _as_display_messages(history: list) -> list[dict]:
             continue
         display.append({"role": role, "content": content})
     return display
+
+
+async def on_send(text, audio, image, history, agent):
+    """Обрабатывает отправку сообщения: возвращает очищенное поле, чат, историю и лог."""
+    try:
+        result = await agent.ask(text or "", audio, image, history)
+    except Exception as error:  # noqa: BLE001
+        raise gr.Error(f"Агент не смог ответить: {error}") from error
+
+    chat = result["history"]
+    display = _as_display_messages(chat)
+
+    # Фейковые (и некоторые реальные) реализации агента могут не класть
+    # реплику пользователя в возвращаемую историю сами — гарантируем, что
+    # в диалоге виден и вопрос, и ответ, а не только ответ.
+    #
+    # Раньше решение "добавлять или нет" принималось по тому, является ли
+    # ПЕРВОЕ отображаемое сообщение репликой пользователя. Это ломалось на
+    # длинных сессиях: после того как trim_history (agent/llm.py) обрезает
+    # историю по MAX_HISTORY_MESSAGES, первым отображаемым сообщением может
+    # оказаться ответ ассистента на более ранний, уже не показываемый ход —
+    # хотя текущий вопрос пользователя уже присутствует в history дальше.
+    # Guard срабатывал и подставлял текущий вопрос ещё раз, в начало чата,
+    # хотя он уже корректно стоял внизу — пользователь видел вопрос дважды.
+    #
+    # Теперь проверяем содержимое, а не позицию: если текущий вопрос уже
+    # встречается среди реплик пользователя в display — ничего не делаем.
+    # Если нет (как в тестовом двойнике, который не кладёт реплику
+    # пользователя в историю сам) — вставляем его на правильное по смыслу
+    # место: непосредственно перед ответом ассистента на этот вопрос, а не
+    # в начало диалога.
+    question = result.get("question") or text or ""
+    if question:
+        already_shown = any(
+            message["role"] == "user" and message["content"] == question
+            for message in display
+        )
+        if not already_shown:
+            if display and display[-1]["role"] == "assistant":
+                display = display[:-1] + [{"role": "user", "content": question}] + display[-1:]
+            else:
+                display = display + [{"role": "user", "content": question}]
+
+    return "", display, chat, format_tool_log(result["tool_log"])
 
 
 async def on_speak(answer: str, make_video: bool, agent):

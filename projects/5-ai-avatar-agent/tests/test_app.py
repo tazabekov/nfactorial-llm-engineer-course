@@ -46,6 +46,36 @@ async def test_on_send_appends_both_messages():
     assert "twogis" in log
 
 
+class TrimmedHistoryAgent(FakeAgent):
+    """Имитирует поведение реального Agent после trim_history: реплика
+    пользователя уже есть в возвращаемой истории, но история обрезана так,
+    что первым отображаемым сообщением оказывается более ранний ответ
+    ассистента (а не текущий вопрос пользователя)."""
+
+    async def ask(self, text, audio_path, image_path, history):
+        question = text or "распознано"
+        return {
+            "question": question,
+            "answer": self.answer,
+            "history": [
+                {"role": "assistant", "content": "старый ответ (обрезанный ход)"},
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": self.answer},
+            ],
+            "tool_log": [],
+        }
+
+
+async def test_on_send_does_not_duplicate_question_after_trim():
+    agent = TrimmedHistoryAgent()
+    textbox, chat, history, log = await app.on_send("новый вопрос", None, None, [], agent)
+
+    occurrences = [m for m in chat if m["role"] == "user" and m["content"] == "новый вопрос"]
+    assert len(occurrences) == 1
+    assert chat[-2] == {"role": "user", "content": "новый вопрос"}
+    assert chat[-1] == {"role": "assistant", "content": agent.answer}
+
+
 async def test_on_speak_without_video_returns_audio_only():
     agent = FakeAgent()
     audio, video, status = await app.on_speak("текст ответа", False, agent)
