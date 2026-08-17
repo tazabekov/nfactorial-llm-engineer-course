@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -30,22 +31,50 @@ PRICES: dict[str, float] = {
 
 
 def record_cost(model: str) -> None:
-    """Дописывает строку в журнал расходов."""
+    """Дописывает строку в журнал расходов.
+
+    Если модели нет в PRICES (опечатка, новая модель из будущей задачи,
+    AVATAR_MODEL переопределён через окружение), запись всё равно пишется —
+    реальный платный вызов нельзя тихо занулять. Такая запись помечается
+    флагом ``unknown_price: True`` и оценка ставится в 0.0 (мы её просто не
+    знаем), а в stderr печатается предупреждение с именем модели, чтобы
+    аномалия не прошла незамеченной.
+    """
     COST_LOG.parent.mkdir(parents=True, exist_ok=True)
-    entry = {"at": time.time(), "model": model, "usd": PRICES.get(model, 0.0)}
+    known = model in PRICES
+    if not known:
+        print(
+            f"⚠️  falcost: неизвестная модель '{model}' не найдена в PRICES — "
+            "возможен реальный расход, который не попадёт в сумму total_spent()",
+            file=sys.stderr,
+        )
+    entry = {
+        "at": time.time(),
+        "model": model,
+        "usd": PRICES.get(model, 0.0),
+        "unknown_price": not known,
+    }
     with COST_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def total_spent() -> float:
-    """Сумма по журналу расходов."""
+    """Сумма по журналу расходов.
+
+    Записи с ``unknown_price: True`` (модель отсутствовала в PRICES на
+    момент вызова) вносят в сумму 0.0, а не реальную стоимость — она
+    неизвестна. Такие записи остаются в логе с этим флагом, поэтому их
+    легко отличить от честного нуля и досчитать вручную по кабинету fal.
+    Любая строка, которая не парсится в JSON-объект (битая/оборванная
+    запись), тихо пропускается — читаемость итога важнее одной строки.
+    """
     if not COST_LOG.exists():
         return 0.0
     total = 0.0
     for line in COST_LOG.read_text(encoding="utf-8").splitlines():
         try:
             total += json.loads(line).get("usd", 0.0)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, AttributeError, TypeError):
             continue
     return round(total, 2)
 
@@ -77,9 +106,17 @@ async def upload(path: str) -> str:
 
 
 def download(url: str, target: Path) -> Path:
-    """Скачивает результат на диск."""
+    """Скачивает результат на диск.
+
+    Решение о сети принимается по FAL_MOCK, а не по виду URL: в mock-режиме
+    run_model может вернуть правдоподобный fal-URL (например,
+    https://v3.fal.media/files/...), и string-matching по префиксу
+    https://mock.local/ такой случай бы пропустил в реальную сеть. Префикс
+    mock.local всё же распознаём отдельно — на случай, если такой URL
+    придёт при выключенном FAL_MOCK.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
-    if url.startswith("https://mock.local/"):
+    if FAL_MOCK or url.startswith("https://mock.local/"):
         target.write_bytes(b"")
         return target
     urllib.request.urlretrieve(url, target)

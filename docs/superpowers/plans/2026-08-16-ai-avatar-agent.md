@@ -2615,6 +2615,7 @@ git commit -m "feat(project-5): цикл tool calling с памятью и по�
 
 ```python
 import json
+from pathlib import Path
 
 import falcost
 
@@ -2678,6 +2679,49 @@ def test_total_spent_sums_log(monkeypatch, tmp_path):
     falcost.record_cost("fal-ai/minimax/voice-clone")
     falcost.record_cost("fal-ai/minimax/voice-clone")
     assert falcost.total_spent() == falcost.PRICES["fal-ai/minimax/voice-clone"] * 2
+
+
+def test_download_in_mock_mode_never_hits_network_even_with_realistic_url(monkeypatch, tmp_path):
+    """download() должен смотреть на FAL_MOCK, а не угадывать mock по виду URL.
+
+    Правдоподобный fal-URL (как в реальном ответе fal.media) не должен
+    приводить к сетевому запросу, если включён mock-режим.
+    """
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("в mock-режиме download не должен трогать сеть")
+
+    monkeypatch.setattr(falcost.urllib.request, "urlretrieve", explode)
+    target = tmp_path / "out" / "result.mp4"
+    result = falcost.download("https://v3.fal.media/files/tiger/abc123_output.mp4", target)
+    assert result == target
+    assert result.exists()
+
+
+def test_unknown_model_records_flagged_entry_and_warns(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "costs.jsonl"
+    monkeypatch.setattr(falcost, "COST_LOG", log)
+    falcost.record_cost("fal-ai/some-new-model-nobody-priced-yet")
+    entries = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert entries[0]["model"] == "fal-ai/some-new-model-nobody-priced-yet"
+    assert entries[0]["unknown_price"] is True
+    assert entries[0]["usd"] == 0.0
+    captured = capsys.readouterr()
+    assert "fal-ai/some-new-model-nobody-priced-yet" in captured.err
+
+
+def test_total_spent_survives_corrupted_log_lines(monkeypatch, tmp_path):
+    log = tmp_path / "costs.jsonl"
+    monkeypatch.setattr(falcost, "COST_LOG", log)
+    lines = [
+        json.dumps({"at": 1.0, "model": "fal-ai/whisper", "usd": 0.01}),
+        "42",  # валидный JSON, но не объект (например, оборванная запись)
+        '{"at": 2.0, "model": "fal-ai/whisper", "usd"',  # truncated / невалидный JSON
+        json.dumps({"at": 3.0, "model": "fal-ai/whisper", "usd": 0.01}),
+    ]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert falcost.total_spent() == 0.02
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -2700,6 +2744,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -2722,22 +2767,50 @@ PRICES: dict[str, float] = {
 
 
 def record_cost(model: str) -> None:
-    """Дописывает строку в журнал расходов."""
+    """Дописывает строку в журнал расходов.
+
+    Если модели нет в PRICES (опечатка, новая модель из будущей задачи,
+    AVATAR_MODEL переопределён через окружение), запись всё равно пишется —
+    реальный платный вызов нельзя тихо занулять. Такая запись помечается
+    флагом ``unknown_price: True`` и оценка ставится в 0.0 (мы её просто не
+    знаем), а в stderr печатается предупреждение с именем модели, чтобы
+    аномалия не прошла незамеченной.
+    """
     COST_LOG.parent.mkdir(parents=True, exist_ok=True)
-    entry = {"at": time.time(), "model": model, "usd": PRICES.get(model, 0.0)}
+    known = model in PRICES
+    if not known:
+        print(
+            f"⚠️  falcost: неизвестная модель '{model}' не найдена в PRICES — "
+            "возможен реальный расход, который не попадёт в сумму total_spent()",
+            file=sys.stderr,
+        )
+    entry = {
+        "at": time.time(),
+        "model": model,
+        "usd": PRICES.get(model, 0.0),
+        "unknown_price": not known,
+    }
     with COST_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def total_spent() -> float:
-    """Сумма по журналу расходов."""
+    """Сумма по журналу расходов.
+
+    Записи с ``unknown_price: True`` (модель отсутствовала в PRICES на
+    момент вызова) вносят в сумму 0.0, а не реальную стоимость — она
+    неизвестна. Такие записи остаются в логе с этим флагом, поэтому их
+    легко отличить от честного нуля и досчитать вручную по кабинету fal.
+    Любая строка, которая не парсится в JSON-объект (битая/оборванная
+    запись), тихо пропускается — читаемость итога важнее одной строки.
+    """
     if not COST_LOG.exists():
         return 0.0
     total = 0.0
     for line in COST_LOG.read_text(encoding="utf-8").splitlines():
         try:
             total += json.loads(line).get("usd", 0.0)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, AttributeError, TypeError):
             continue
     return round(total, 2)
 
@@ -2769,9 +2842,17 @@ async def upload(path: str) -> str:
 
 
 def download(url: str, target: Path) -> Path:
-    """Скачивает результат на диск."""
+    """Скачивает результат на диск.
+
+    Решение о сети принимается по FAL_MOCK, а не по виду URL: в mock-режиме
+    run_model может вернуть правдоподобный fal-URL (например,
+    https://v3.fal.media/files/...), и string-matching по префиксу
+    https://mock.local/ такой случай бы пропустил в реальную сеть. Префикс
+    mock.local всё же распознаём отдельно — на случай, если такой URL
+    придёт при выключенном FAL_MOCK.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
-    if url.startswith("https://mock.local/"):
+    if FAL_MOCK or url.startswith("https://mock.local/"):
         target.write_bytes(b"")
         return target
     urllib.request.urlretrieve(url, target)
@@ -2781,7 +2862,7 @@ def download(url: str, target: Path) -> Path:
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_falcost.py -v`
-Expected: PASS, 4 passed.
+Expected: PASS, 7 passed.
 
 - [ ] **Step 5: Коммит**
 

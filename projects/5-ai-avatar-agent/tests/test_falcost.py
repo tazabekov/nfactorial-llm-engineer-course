@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import falcost
 
@@ -62,3 +63,46 @@ def test_total_spent_sums_log(monkeypatch, tmp_path):
     falcost.record_cost("fal-ai/minimax/voice-clone")
     falcost.record_cost("fal-ai/minimax/voice-clone")
     assert falcost.total_spent() == falcost.PRICES["fal-ai/minimax/voice-clone"] * 2
+
+
+def test_download_in_mock_mode_never_hits_network_even_with_realistic_url(monkeypatch, tmp_path):
+    """download() должен смотреть на FAL_MOCK, а не угадывать mock по виду URL.
+
+    Правдоподобный fal-URL (как в реальном ответе fal.media) не должен
+    приводить к сетевому запросу, если включён mock-режим.
+    """
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("в mock-режиме download не должен трогать сеть")
+
+    monkeypatch.setattr(falcost.urllib.request, "urlretrieve", explode)
+    target = tmp_path / "out" / "result.mp4"
+    result = falcost.download("https://v3.fal.media/files/tiger/abc123_output.mp4", target)
+    assert result == target
+    assert result.exists()
+
+
+def test_unknown_model_records_flagged_entry_and_warns(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "costs.jsonl"
+    monkeypatch.setattr(falcost, "COST_LOG", log)
+    falcost.record_cost("fal-ai/some-new-model-nobody-priced-yet")
+    entries = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert entries[0]["model"] == "fal-ai/some-new-model-nobody-priced-yet"
+    assert entries[0]["unknown_price"] is True
+    assert entries[0]["usd"] == 0.0
+    captured = capsys.readouterr()
+    assert "fal-ai/some-new-model-nobody-priced-yet" in captured.err
+
+
+def test_total_spent_survives_corrupted_log_lines(monkeypatch, tmp_path):
+    log = tmp_path / "costs.jsonl"
+    monkeypatch.setattr(falcost, "COST_LOG", log)
+    lines = [
+        json.dumps({"at": 1.0, "model": "fal-ai/whisper", "usd": 0.01}),
+        "42",  # валидный JSON, но не объект (например, оборванная запись)
+        '{"at": 2.0, "model": "fal-ai/whisper", "usd"',  # truncated / невалидный JSON
+        json.dumps({"at": 3.0, "model": "fal-ai/whisper", "usd": 0.01}),
+    ]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert falcost.total_spent() == 0.02
