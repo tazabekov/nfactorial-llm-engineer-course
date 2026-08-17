@@ -74,7 +74,15 @@ def total_spent() -> float:
     for line in COST_LOG.read_text(encoding="utf-8").splitlines():
         try:
             total += json.loads(line).get("usd", 0.0)
-        except (json.JSONDecodeError, AttributeError, TypeError):
+        except (json.JSONDecodeError, AttributeError, TypeError) as error:
+            # Строка битая целиком (не JSON, не объект) или поле usd —
+            # не число (например, "n/a" после ручной правки лога).
+            # Пропускаем её, чтобы не упасть, но не молча: предупреждаем
+            # в stderr, иначе реальный расход тихо исчезнет из суммы.
+            print(
+                f"⚠️  falcost: пропущена повреждённая строка в {COST_LOG}: {error}",
+                file=sys.stderr,
+            )
             continue
     return round(total, 2)
 
@@ -117,6 +125,14 @@ def download(url: str, target: Path) -> Path:
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     if FAL_MOCK or url.startswith("https://mock.local/"):
+        # По заданию дорогое видео генерируют последним: разработчик мог уже
+        # получить настоящий файл, а затем перезапустить пайплайн в
+        # mock-режиме, чтобы отладить код дальше по цепочке без повторной
+        # оплаты. Если target уже существует и не пуст — это тот самый
+        # настоящий результат, и его нельзя молча затирать нулевым файлом.
+        # Пустышку создаём только тогда, когда сохранять нечего.
+        if target.exists() and target.stat().st_size > 0:
+            return target
         target.write_bytes(b"")
         return target
     urllib.request.urlretrieve(url, target)

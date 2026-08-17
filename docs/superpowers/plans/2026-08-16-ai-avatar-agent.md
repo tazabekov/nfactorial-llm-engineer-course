@@ -2615,7 +2615,6 @@ git commit -m "feat(project-5): цикл tool calling с памятью и по�
 
 ```python
 import json
-from pathlib import Path
 
 import falcost
 
@@ -2722,6 +2721,60 @@ def test_total_spent_survives_corrupted_log_lines(monkeypatch, tmp_path):
     ]
     log.write_text("\n".join(lines) + "\n", encoding="utf-8")
     assert falcost.total_spent() == 0.02
+
+
+def test_download_in_mock_mode_preserves_existing_real_file(monkeypatch, tmp_path):
+    """Mock-режим не должен затирать уже скачанный настоящий файл.
+
+    Сценарий из задания: дорогое видео генерируют последним, поэтому
+    разработчик мог получить реальный файл, а затем перезапустить пайплайн
+    в mock-режиме для отладки остального кода. Существующий непустой
+    target — это тот самый результат, его нужно оставить нетронутым.
+    """
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+    target = tmp_path / "out" / "result.mp4"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"real video bytes")
+
+    result = falcost.download("https://v3.fal.media/files/tiger/abc123_output.mp4", target)
+
+    assert result == target
+    assert target.read_bytes() == b"real video bytes"
+
+
+def test_download_in_mock_mode_creates_placeholder_when_no_target(monkeypatch, tmp_path):
+    """А если сохранять нечего — заглушка по-прежнему создаётся как раньше."""
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+    target = tmp_path / "out" / "result.mp4"
+
+    result = falcost.download("https://v3.fal.media/files/tiger/abc123_output.mp4", target)
+
+    assert result == target
+    assert target.exists()
+    assert target.read_bytes() == b""
+
+
+def test_total_spent_warns_on_bad_amount_but_sums_valid_entries(monkeypatch, tmp_path, capsys):
+    """Запись с некорректным usd не должна исчезать без следа.
+
+    TypeError при сложении числа со строкой перехватывается (падать нельзя),
+    но потеря записи из суммы должна быть видна в stderr — так же, как для
+    неизвестных моделей.
+    """
+    log = tmp_path / "costs.jsonl"
+    monkeypatch.setattr(falcost, "COST_LOG", log)
+    lines = [
+        json.dumps({"at": 1.0, "model": "fal-ai/whisper", "usd": 0.01}),
+        json.dumps({"at": 2.0, "model": "fal-ai/whisper", "usd": "n/a"}),
+        json.dumps({"at": 3.0, "model": "fal-ai/whisper", "usd": 0.01}),
+    ]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    total = falcost.total_spent()
+
+    assert total == 0.02
+    captured = capsys.readouterr()
+    assert captured.err.strip() != ""
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -2801,8 +2854,10 @@ def total_spent() -> float:
     момент вызова) вносят в сумму 0.0, а не реальную стоимость — она
     неизвестна. Такие записи остаются в логе с этим флагом, поэтому их
     легко отличить от честного нуля и досчитать вручную по кабинету fal.
-    Любая строка, которая не парсится в JSON-объект (битая/оборванная
-    запись), тихо пропускается — читаемость итога важнее одной строки.
+    Любая строка, которая не парсится в JSON-объект, или в которой поле
+    usd — не число (битая/оборванная запись), пропускается, чтобы не
+    падать, но не молча: в stderr печатается предупреждение, иначе
+    реальный расход тихо исчезнет из суммы без следа.
     """
     if not COST_LOG.exists():
         return 0.0
@@ -2810,7 +2865,11 @@ def total_spent() -> float:
     for line in COST_LOG.read_text(encoding="utf-8").splitlines():
         try:
             total += json.loads(line).get("usd", 0.0)
-        except (json.JSONDecodeError, AttributeError, TypeError):
+        except (json.JSONDecodeError, AttributeError, TypeError) as error:
+            print(
+                f"⚠️  falcost: пропущена повреждённая строка в {COST_LOG}: {error}",
+                file=sys.stderr,
+            )
             continue
     return round(total, 2)
 
@@ -2853,6 +2912,14 @@ def download(url: str, target: Path) -> Path:
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     if FAL_MOCK or url.startswith("https://mock.local/"):
+        # По заданию дорогое видео генерируют последним: разработчик мог
+        # уже получить настоящий файл, а затем перезапустить пайплайн в
+        # mock-режиме, чтобы отладить код дальше по цепочке без повторной
+        # оплаты. Если target уже существует и не пуст — это тот самый
+        # настоящий результат, и его нельзя молча затирать нулевым файлом.
+        # Пустышку создаём только тогда, когда сохранять нечего.
+        if target.exists() and target.stat().st_size > 0:
+            return target
         target.write_bytes(b"")
         return target
     urllib.request.urlretrieve(url, target)
@@ -2862,7 +2929,7 @@ def download(url: str, target: Path) -> Path:
 - [ ] **Step 4: Запустить тесты**
 
 Run: `cd projects/5-ai-avatar-agent && .venv/bin/pytest tests/test_falcost.py -v`
-Expected: PASS, 7 passed.
+Expected: PASS, 10 passed.
 
 - [ ] **Step 5: Коммит**
 

@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import falcost
 
@@ -106,3 +105,57 @@ def test_total_spent_survives_corrupted_log_lines(monkeypatch, tmp_path):
     ]
     log.write_text("\n".join(lines) + "\n", encoding="utf-8")
     assert falcost.total_spent() == 0.02
+
+
+def test_download_in_mock_mode_preserves_existing_real_file(monkeypatch, tmp_path):
+    """Mock-режим не должен затирать уже скачанный настоящий файл.
+
+    Сценарий из задания: дорогое видео генерируют последним, поэтому
+    разработчик мог получить реальный файл, а затем перезапустить пайплайн
+    в mock-режиме для отладки остального кода. Существующий непустой
+    target — это тот самый результат, его нужно оставить нетронутым.
+    """
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+    target = tmp_path / "out" / "result.mp4"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"real video bytes")
+
+    result = falcost.download("https://v3.fal.media/files/tiger/abc123_output.mp4", target)
+
+    assert result == target
+    assert target.read_bytes() == b"real video bytes"
+
+
+def test_download_in_mock_mode_creates_placeholder_when_no_target(monkeypatch, tmp_path):
+    """А если сохранять нечего — заглушка по-прежнему создаётся как раньше."""
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+    target = tmp_path / "out" / "result.mp4"
+
+    result = falcost.download("https://v3.fal.media/files/tiger/abc123_output.mp4", target)
+
+    assert result == target
+    assert target.exists()
+    assert target.read_bytes() == b""
+
+
+def test_total_spent_warns_on_bad_amount_but_sums_valid_entries(monkeypatch, tmp_path, capsys):
+    """Запись с некорректным usd не должна исчезать без следа.
+
+    TypeError при сложении числа со строкой перехватывается (падать нельзя),
+    но потеря записи из суммы должна быть видна в stderr — так же, как для
+    неизвестных моделей.
+    """
+    log = tmp_path / "costs.jsonl"
+    monkeypatch.setattr(falcost, "COST_LOG", log)
+    lines = [
+        json.dumps({"at": 1.0, "model": "fal-ai/whisper", "usd": 0.01}),
+        json.dumps({"at": 2.0, "model": "fal-ai/whisper", "usd": "n/a"}),
+        json.dumps({"at": 3.0, "model": "fal-ai/whisper", "usd": 0.01}),
+    ]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    total = falcost.total_spent()
+
+    assert total == 0.02
+    captured = capsys.readouterr()
+    assert captured.err.strip() != ""
