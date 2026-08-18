@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+.pytest_cache/
+cache/
+output/
+assets-private/
+*.mp3
+*.mp4
+!assets/demo.mp4
+
+# Личные материалы владельца: в ZIP для сдачи попадают (папки voice/ и avatar/
+# скрипт сборки не исключает), но в публичный репозиторий не публикуются.
+voice/my_voice_sample.*
+avatar/my_photo.*
+
+# Исходники видео-демо: в архив и репозиторий идёт только склеенный assets/demo.mp4
+assets/demo1.*
+assets/demo2.*
+
+# Собранный архив для сдачи
+*.zip
