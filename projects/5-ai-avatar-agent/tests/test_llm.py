@@ -295,3 +295,50 @@ def test_build_user_message_missing_image_degrades_to_text():
     message = llm.build_user_message("что это", "/no/such/file.jpg")
     assert isinstance(message["content"], str)
     assert "что это" in message["content"]
+
+
+def test_build_user_message_does_not_leak_local_path_into_visible_text(tmp_path):
+    """M4: локальный путь к файлу на диске сервера — техническая деталь,
+    которую пользователь не должен видеть в чате. Раньше он подставлялся
+    прямо в текстовую часть content, которую app.py показывает как есть."""
+    image = tmp_path / "секретный_путь_с_именем_юзера.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xe0")
+    message = llm.build_user_message("что это", str(image))
+    text_parts = [part["text"] for part in message["content"] if part["type"] == "text"]
+    assert all(str(image) not in part for part in text_parts)
+    assert text_parts == ["что это"]
+
+
+async def test_run_turn_still_lets_model_call_tool_with_image_path(tmp_path):
+    """M4: путь убран из видимого текста, но модель по-прежнему должна знать
+    его, чтобы вызвать analyze_restaurant_photo(image_path=...) — run_turn
+    подмешивает его отдельной system-подсказкой, которая не видна в чате и
+    не попадает в persist-историю."""
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xe0")
+    verdict = skills.RestaurantVerdict(
+        level="casual", status="семейный", description="ок", confidence=0.5
+    )
+    toolset = FakeToolset()
+    client = FakeClientWithVision(
+        [
+            FakeMessage(
+                tool_calls=[
+                    FakeToolCall("c1", "analyze_restaurant_photo", {"image_path": str(image)})
+                ]
+            ),
+            FakeMessage(content="Похоже на casual"),
+        ],
+        verdict,
+    )
+    user_message = llm.build_user_message("что скажешь по фото", str(image))
+    _, history, log = await llm.run_turn(client, toolset, [], user_message, str(image))
+
+    assert any(entry["name"] == "analyze_restaurant_photo" for entry in log)
+    # Подсказка с путём не должна просочиться в возвращаемую (и далее
+    # отображаемую) историю — только основной system-промпт исключается
+    # автоматически, но наша дополнительная подсказка — тоже role == "system"
+    # и попадает под то же правило (_is_history_message).
+    assert not any(
+        isinstance(m, dict) and m.get("role") == "system" for m in history
+    )

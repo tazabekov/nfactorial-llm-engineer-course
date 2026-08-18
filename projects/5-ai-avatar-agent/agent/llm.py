@@ -123,10 +123,17 @@ def build_user_message(text: str, image_path: str | None) -> dict:
             "role": "user",
             "content": f"{text}\n\n(Не удалось прочитать присланное фото: {error})",
         }
+    # Путь к файлу в текст НЕ кладём: этот текст идёт прямиком в чат, который
+    # видит пользователь (app.py собирает отображаемые реплики именно из
+    # частей content с type == "text"), а локальный путь на диске сервера —
+    # техническая деталь, которая ему не нужна и не должна быть видна. Модели
+    # путь всё равно нужен — она передаёт его аргументом image_path в вызов
+    # analyze_restaurant_photo — поэтому run_turn отдельно подмешивает его
+    # системной подсказкой, которая в chat-историю не попадает (см. M4).
     return {
         "role": "user",
         "content": [
-            {"type": "text", "text": f"{text}\n\n(Путь к присланному фото: {image_path})"},
+            {"type": "text", "text": text},
             {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}},
         ],
     }
@@ -164,14 +171,33 @@ async def run_turn(
     toolset: Any,
     history: list,
     user_message: dict,
+    image_path: str | None = None,
 ) -> tuple[str, list, list]:
     """Прогоняет один ход диалога.
+
+    ``image_path`` — путь к присланному фото (если оно было), нужен только
+    модели, чтобы передать его аргументом в вызов analyze_restaurant_photo.
+    В user_message (и тем самым в chat-истории, которую видит пользователь)
+    этого пути нет намеренно — см. build_user_message. Подсказка идёт
+    отдельным system-сообщением, которое в конце хода отфильтровывается из
+    persist-истории вместе с основным системным промптом
+    (_is_history_message исключает role == "system").
 
     Возвращает текст ответа, обновлённую историю и лог вызовов инструментов
     за этот ход.
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + trim_history(history)
     messages.append(user_message)
+    if image_path:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"Путь к файлу присланного фото для аргумента image_path "
+                    f"инструмента analyze_restaurant_photo: {image_path}"
+                ),
+            }
+        )
 
     tools = toolset.specs() + [ANALYZE_TOOL_SPEC]
     log_start = len(getattr(toolset, "call_log", []))
