@@ -11,8 +11,10 @@ rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
       --exclude 'cache' --exclude 'output' --exclude 'assets-private' \
       --exclude '.env' --exclude '*.pt' --exclude '*.bin' --exclude '*.ckpt' \
       --exclude 'assets/demo1.*' --exclude 'assets/demo2.*' \
+      --exclude '*.zip' \
       "${PROJECT_DIR}/" "${STAGING}/"
 
+rm -f "${PROJECT_DIR}/${NAME}.zip"   # иначе прошлая сборка попадёт внутрь новой
 cd "$(dirname "${STAGING}")"
 zip -rq "${PROJECT_DIR}/${NAME}.zip" "${NAME}"
 echo "Готово: ${PROJECT_DIR}/${NAME}.zip"
