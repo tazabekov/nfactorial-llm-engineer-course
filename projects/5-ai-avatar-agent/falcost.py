@@ -15,7 +15,7 @@ from pathlib import Path
 
 import fal_client
 
-from config import CACHE_DIR, FAL_MOCK
+from config import CACHE_DIR, FAL_BUDGET_CEILING_USD, FAL_MOCK
 
 COST_LOG = Path(CACHE_DIR) / "costs.jsonl"
 
@@ -104,6 +104,17 @@ async def run_model(model: str, arguments: dict, mock_result: dict, attempts: in
     if FAL_MOCK:
         print(f"🧪 mock: {model} (реальный вызов не выполнен)")
         return mock_result
+
+    # Мягкий потолок расходов: считаем ПЕРЕД реальным платным вызовом, чтобы
+    # отказ ни разу не позволил превысить бюджет — при достижении/превышении
+    # платный вызов вообще не делается, только заглушка ошибки.
+    spent = total_spent()
+    if spent >= FAL_BUDGET_CEILING_USD:
+        raise RuntimeError(
+            f"Бюджет на платные вызовы fal исчерпан: потрачено ${spent:.2f} "
+            f"при потолке ${FAL_BUDGET_CEILING_USD:.2f}. Чтобы продолжить, "
+            "подними FAL_BUDGET_CEILING_USD в .env в корне репозитория."
+        )
 
     last_error: Exception | None = None
     for attempt in range(attempts):

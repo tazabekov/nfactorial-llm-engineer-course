@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import falcost
 
 
@@ -200,6 +202,59 @@ def test_download_in_mock_mode_creates_placeholder_when_no_target(monkeypatch, t
     assert result == target
     assert target.exists()
     assert target.read_bytes() == b""
+
+
+async def test_run_model_proceeds_when_below_budget_ceiling(monkeypatch, tmp_path):
+    """I6: пока total_spent() ниже потолка, платный вызов должен пройти как
+    обычно — бюджетный guard не должен мешать нормальной работе."""
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    monkeypatch.setattr(falcost, "FAL_BUDGET_CEILING_USD", 5.0)
+
+    async def fake_subscribe(model, arguments=None, **kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", fake_subscribe)
+    result = await falcost.run_model("fal-ai/whisper", {}, {"text": "x"})
+    assert result == {"ok": True}
+
+
+async def test_run_model_refuses_when_at_or_above_budget_ceiling(monkeypatch, tmp_path):
+    """I6: как только total_spent() достиг потолка (или превысил его),
+    run_model обязан отказать ДО реального платного вызова — деньги не
+    должны тратиться сверх заявленного лимита."""
+    monkeypatch.setattr(falcost, "FAL_MOCK", False)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    monkeypatch.setattr(falcost, "FAL_BUDGET_CEILING_USD", 1.0)
+    # Уже потрачено ровно 1.00 — это "на уровне потолка", а не "выше".
+    falcost.record_cost("fal-ai/creatify/aurora")
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("бюджет исчерпан — платный вызов делать нельзя")
+
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", explode)
+
+    with pytest.raises(RuntimeError) as exc:
+        await falcost.run_model("fal-ai/whisper", {}, {"text": "x"})
+    message = str(exc.value)
+    assert "1.0" in message or "1.00" in message
+    assert "FAL_BUDGET_CEILING_USD" in message
+
+
+async def test_run_model_budget_guard_does_not_apply_in_mock_mode(monkeypatch, tmp_path):
+    """I6: mock-вызовы не должны затрагиваться потолком бюджета — они и так
+    ничего не стоят и не должны отказывать даже при "исчерпанном" логе."""
+    monkeypatch.setattr(falcost, "FAL_MOCK", True)
+    monkeypatch.setattr(falcost, "COST_LOG", tmp_path / "costs.jsonl")
+    monkeypatch.setattr(falcost, "FAL_BUDGET_CEILING_USD", 1.0)
+    falcost.record_cost("fal-ai/creatify/aurora")
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("в mock-режиме сеть трогать нельзя")
+
+    monkeypatch.setattr(falcost.fal_client, "subscribe_async", explode)
+    result = await falcost.run_model("fal-ai/whisper", {}, {"text": "заглушка"})
+    assert result == {"text": "заглушка"}
 
 
 def test_total_spent_warns_on_bad_amount_but_sums_valid_entries(monkeypatch, tmp_path, capsys):
