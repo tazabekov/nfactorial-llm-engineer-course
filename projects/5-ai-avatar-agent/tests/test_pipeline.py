@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from agent import pipeline
@@ -28,7 +29,7 @@ async def test_ask_transcribes_audio_when_no_text(monkeypatch):
     async def fake_transcribe(path):
         return "распознанный вопрос"
 
-    async def fake_run_turn(client, toolset, history, user_message):
+    async def fake_run_turn(client, toolset, history, user_message, image_path=None):
         return f"ответ на: {user_message['content']}", history + [user_message], []
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
@@ -43,7 +44,7 @@ async def test_ask_returns_tool_log(monkeypatch):
     agent = pipeline.Agent()
     agent._toolset = FakeToolset()
 
-    async def fake_run_turn(client, toolset, history, user_message):
+    async def fake_run_turn(client, toolset, history, user_message, image_path=None):
         return "готово", history, [{"name": "twogis__search_restaurants", "result_size": 3}]
 
     monkeypatch.setattr(pipeline, "run_turn", fake_run_turn)
@@ -64,6 +65,38 @@ async def test_start_is_lazy_and_idempotent(monkeypatch):
     await agent.start()
     await agent.start()
     assert len(created) == 1
+
+
+async def test_concurrent_start_opens_toolset_exactly_once(monkeypatch):
+    """I5: два одновременных обработчика Gradio (кнопка "Спросить" и submit
+    текстового поля — разные очереди; или две открытые вкладки) вызывают
+    Agent.start() параллельно. Без лока оба проходят проверку
+    `self._toolset is None` до того, как первый await toolset.open()
+    завершится, и поднимают по полному набору MCP-подпроцессов каждый —
+    один набор остаётся сиротой без stop(). С асинхронным локом и двойной
+    проверкой (как в BrowserPool.start()) toolset должен открыться ровно
+    один раз."""
+    opened = []
+
+    class SlowToolset(FakeToolset):
+        def __init__(self, servers):
+            super().__init__()
+
+        async def open(self):
+            # Имитируем реальный запуск MCP-подпроцессов: не мгновенный,
+            # чтобы конкурентные вызовы start() гарантированно пересеклись
+            # во времени, а не выполнились последовательно случайно.
+            await asyncio.sleep(0.01)
+            opened.append(1)
+            self.opened = True
+
+    monkeypatch.setattr(pipeline, "McpToolset", SlowToolset)
+    agent = pipeline.Agent()
+
+    await asyncio.gather(agent.start(), agent.start(), agent.start())
+
+    assert len(opened) == 1
+    assert agent._toolset is not None
 
 
 async def test_speak_uses_cached_voice(monkeypatch, tmp_path):

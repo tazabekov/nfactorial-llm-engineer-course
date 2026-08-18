@@ -5,6 +5,7 @@ ASR → агент с инструментами → (по требованию)
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -49,6 +50,7 @@ class Agent:
     def __init__(self) -> None:
         self._client = _LazyOpenAIClient()
         self._toolset: McpToolset | None = None
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Поднимает MCP-серверы.
@@ -57,13 +59,24 @@ class Agent:
         к событийному циклу, в котором были созданы, а Gradio крутит свой
         собственный. Поднимать их заранее в другом цикле — гарантированная
         поломка при первом же вызове инструмента.
+
+        Двойная проверка под локом — как в mcp_servers/common/browser.py
+        (BrowserPool.start): без лока два параллельных обработчика Gradio (у
+        кнопки "Спросить" и у submit текстового поля — отдельные очереди; или
+        две открытые вкладки) оба проходят проверку `self._toolset is None`
+        до того, как await toolset.open() успевает её изменить, и запускают
+        по полному набору MCP-подпроцессов каждый. Один из наборов остаётся
+        висеть осиротевшим — stop() для него никто не вызовет.
         """
         if self._toolset is not None:
             return
-        toolset = McpToolset(SERVER_PATHS)
-        await toolset.open()
-        self._toolset = toolset
-        print(f"✅ Подняты MCP-серверы: {', '.join(SERVER_PATHS)}")
+        async with self._start_lock:
+            if self._toolset is not None:
+                return
+            toolset = McpToolset(SERVER_PATHS)
+            await toolset.open()
+            self._toolset = toolset
+            print(f"✅ Подняты MCP-серверы: {', '.join(SERVER_PATHS)}")
 
     async def stop(self) -> None:
         if self._toolset is not None:
@@ -94,7 +107,7 @@ class Agent:
 
         user_message = build_user_message(question, image_path)
         answer, new_history, tool_log = await run_turn(
-            self._client, self._toolset, history, user_message
+            self._client, self._toolset, history, user_message, image_path
         )
         return {
             "question": question,
