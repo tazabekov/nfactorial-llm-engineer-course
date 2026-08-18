@@ -125,7 +125,11 @@ def build_ui(agent: Agent) -> gr.Blocks:
 
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(type="messages", height=420, label="Диалог")
+                # В Gradio 6 формат сообщений ({"role", "content"}) единственный,
+                # а параметр type удалён — передавать его нельзя, приложение упадёт
+                # на старте. В Gradio 5 он был обязателен, поэтому версия закреплена
+                # в requirements.txt.
+                chatbot = gr.Chatbot(height=420, label="Диалог")
                 textbox = gr.Textbox(
                     placeholder="Где поужинать в центре на двоих, бюджет 15 000 тенге?",
                     label="Вопрос",

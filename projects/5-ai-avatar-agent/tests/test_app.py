@@ -99,3 +99,14 @@ async def test_on_speak_reports_failure_without_crashing():
     audio, video, status = await app.on_speak("текст", True, BrokenAgent())
     assert audio is None
     assert "недоступен" in status
+
+
+def test_build_ui_constructs_without_errors():
+    """Интерфейс должен собираться — иначе приложение падает на старте.
+
+    Этот тест ловит несовместимости с версией Gradio (например, удалённый
+    в Gradio 6 параметр Chatbot(type=...)), которые остальные тесты не видят:
+    они дёргают обработчики напрямую, минуя build_ui.
+    """
+    demo = app.build_ui(FakeAgent())
+    assert demo is not None
