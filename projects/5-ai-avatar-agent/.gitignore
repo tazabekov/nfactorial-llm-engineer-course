@@ -7,3 +7,8 @@ assets-private/
 *.mp3
 *.mp4
 !assets/demo.mp4
+
+# Личные материалы владельца: в ZIP для сдачи попадают (папки voice/ и avatar/
+# скрипт сборки не исключает), но в публичный репозиторий не публикуются.
+voice/my_voice_sample.*
+avatar/my_photo.*
