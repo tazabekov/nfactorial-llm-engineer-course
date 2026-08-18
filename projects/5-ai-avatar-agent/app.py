@@ -50,6 +50,22 @@ def _as_display_messages(history: list) -> list[dict]:
     return display
 
 
+def extract_last_answer(display: list[dict]) -> str:
+    """Достаёт текст последнего ответа ассистента из отображаемого чата.
+
+    Используется, чтобы привязать к кнопке «Озвучить» именно ответ, а не
+    последнюю реплику вообще. on_send гарантирует (см. ниже), что когда
+    result["answer"] непусто, оно оказывается последним элементом display
+    с ролью assistant — поэтому этой проверки достаточно: если последняя
+    реплика не assistant (например, ответ модели пуст и его нечем было
+    показать), безопаснее вернуть пустую строку, чем случайно отдать на
+    озвучку вопрос пользователя за ~$1.02 (см. I2 финального ревью).
+    """
+    if display and display[-1]["role"] == "assistant":
+        return display[-1]["content"]
+    return ""
+
+
 async def on_send(text, audio, image, history, agent):
     """Обрабатывает отправку сообщения: возвращает очищенное поле, чат, историю и лог."""
     try:
@@ -91,7 +107,46 @@ async def on_send(text, audio, image, history, agent):
             else:
                 display = display + [{"role": "user", "content": question}]
 
+    # I2/M2: result["answer"] — единственный правдивый источник ответа.
+    # Раньше вызывающая сторона (build_ui._send) брала display[-1]["content"]
+    # напрямую, а run_turn (agent/llm.py) при срабатывании лимита вызовов
+    # инструментов кладёт в историю только assistant-сообщение с tool_calls
+    # и пустым content — сам CAP_REACHED_MESSAGE в history не попадает. Из-за
+    # этого _as_display_messages отбрасывал это сообщение (пустой content),
+    # и последней отображаемой репликой оставался вопрос ПОЛЬЗОВАТЕЛЯ — его
+    # затем и озвучивали за ~$1.02 при нажатии "Озвучить". То же самое
+    # затрагивало M2: пустой сабмит — result["answer"] заполнен подсказкой
+    # ("Напиши вопрос..."), но pipeline.ask не трогает history вовсе, и
+    # подсказка нигде не показывалась.
+    #
+    # Чиним в одном месте: если result["answer"] непустой и его ещё нет в
+    # конце display как ответа ассистента — дописываем его туда сами. После
+    # этого extract_last_answer() и любой другой код, читающий "последний
+    # ответ" из display, видит правильный текст.
+    answer = result.get("answer") or ""
+    if answer and extract_last_answer(display) != answer:
+        display = display + [{"role": "assistant", "content": answer}]
+
     return "", display, chat, format_tool_log(result["tool_log"])
+
+
+def mock_banner_text() -> str | None:
+    """Текст предупреждения о mock-режиме для шапки интерфейса.
+
+    None, если FAL_MOCK выключен — тогда баннер вообще не рисуется. Вынесено
+    в отдельную функцию, чтобы её можно было проверить тестом без разбора
+    внутренностей gr.Blocks.
+    """
+    if not config.FAL_MOCK:
+        return None
+    return (
+        "🧪 **Включён режим заглушки (FAL_MOCK=1).** Распознавание голоса, "
+        "озвучка ответа и видео с аватаром — ПОДДЕЛЬНЫЕ: голосовой вопрос "
+        "заменяется заранее заданным текстом (с префиксом "
+        "«[РЕЖИМ ЗАГЛУШКИ...]»), а аудио- и видеофайлы — пустышки на 0 байт. "
+        "Чтобы включить настоящие платные вызовы fal.ai, поставь `FAL_MOCK=0` "
+        "и задай `FAL_KEY` в `.env` в корне репозитория."
+    )
 
 
 async def on_speak(answer: str, make_video: bool, agent):
@@ -103,14 +158,32 @@ async def on_speak(answer: str, make_video: bool, agent):
     except Exception as error:  # noqa: BLE001
         return None, None, f"Озвучка не удалась: {error}"
 
+    # C1: в mock-режиме falcost.download() пишет 0-байтовые файлы-заглушки.
+    # Нельзя говорить пользователю "Готово" — это создаёт впечатление, что
+    # получен настоящий звук/видео, хотя файл пустой.
     if not make_video:
-        return str(audio_path), None, "Готово: аудио."
+        if config.FAL_MOCK:
+            status = (
+                "🧪 Mock-режим: аудио НЕ озвучено по-настоящему, файл — "
+                "пустая заглушка. Выключи FAL_MOCK, чтобы получить реальный звук."
+            )
+        else:
+            status = "Готово: аудио."
+        return str(audio_path), None, status
 
     try:
         video_path = await agent.make_video(str(audio_path))
     except Exception as error:  # noqa: BLE001
         return str(audio_path), None, f"Аудио готово, видео не собралось: {error}"
-    return str(audio_path), str(video_path), "Готово: аудио и видео."
+
+    if config.FAL_MOCK:
+        status = (
+            "🧪 Mock-режим: аудио и видео НЕ сгенерированы по-настоящему, "
+            "файлы — пустые заглушки. Выключи FAL_MOCK, чтобы получить реальный результат."
+        )
+    else:
+        status = "Готово: аудио и видео."
+    return str(audio_path), str(video_path), status
 
 
 def build_ui(agent: Agent) -> gr.Blocks:
@@ -120,6 +193,9 @@ def build_ui(agent: Agent) -> gr.Blocks:
             "# 🍽️ Проводник по ресторанам Алматы\n"
             "Спроси текстом, голосом или пришли фото заведения."
         )
+        banner = mock_banner_text()
+        if banner:
+            gr.Markdown(banner)
         history_state = gr.State([])
         last_answer = gr.State("")
 
@@ -157,18 +233,28 @@ def build_ui(agent: Agent) -> gr.Blocks:
             textbox_value, display, new_history, log = await on_send(
                 text, audio, image, history, agent
             )
-            answer = display[-1]["content"] if display else ""
-            return textbox_value, display, new_history, log, answer
+            # I2: берём ответ через extract_last_answer(), а не сырым
+            # display[-1] — on_send уже гарантирует, что непустой
+            # result["answer"] оказывается там последней репликой ассистента,
+            # а extract_last_answer() дополнительно подстраховывает: если
+            # последняя реплика всё же не ассистентская, отдаёт "", а не
+            # чужой вопрос, который иначе улетел бы в платную озвучку/видео.
+            answer = extract_last_answer(display)
+            # M3: очищаем поля голоса и фото после успешной отправки — иначе
+            # следующий ход молча повторно пришлёт то же фото и заново
+            # распознает то же аудио (лишние токены и повторный платный
+            # вызов ASR).
+            return textbox_value, display, new_history, log, answer, None, None
 
         send.click(
             _send,
             [textbox, audio_in, image_in, history_state],
-            [textbox, chatbot, history_state, tool_log, last_answer],
+            [textbox, chatbot, history_state, tool_log, last_answer, audio_in, image_in],
         )
         textbox.submit(
             _send,
             [textbox, audio_in, image_in, history_state],
-            [textbox, chatbot, history_state, tool_log, last_answer],
+            [textbox, chatbot, history_state, tool_log, last_answer, audio_in, image_in],
         )
 
         async def _speak(answer, video_wanted):
