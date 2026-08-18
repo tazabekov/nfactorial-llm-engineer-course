@@ -15,6 +15,14 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
 
+# Загружаем .env корня репозитория ДО чтения os.getenv() ниже — иначе
+# FAL_MOCK=0, AGENT_MODEL и другие переопределения из .env тихо
+# игнорируются (работает только форма PREFIX=value python app.py, .env
+# читается лишь позже, изнутри load_environment()). load_dotenv по
+# умолчанию не перезаписывает уже установленные переменные окружения,
+# поэтому shell-форма переопределения продолжает работать как раньше.
+load_dotenv(REPO_ROOT / ".env")
+
 CACHE_DIR = BASE_DIR / "cache"
 OUTPUT_DIR = BASE_DIR / "output"
 ASSETS_PRIVATE_DIR = BASE_DIR / "assets-private"
@@ -45,9 +53,23 @@ OFFLINE = os.getenv("AVATAR_AGENT_OFFLINE", "0") == "1"
 # FAL_MOCK: платные вызовы fal возвращают заглушки. По умолчанию включён.
 FAL_MOCK = os.getenv("FAL_MOCK", "1") == "1"
 
+# --- Бюджет ---------------------------------------------------------------
+# Мягкий потолок суммарных расходов на платные вызовы fal (см. falcost.py).
+# При достижении/превышении falcost.run_model отказывается делать новый
+# платный вызов вместо того, чтобы тратить дальше без ограничений.
+FAL_BUDGET_CEILING_USD = float(os.getenv("FAL_BUDGET_CEILING_USD", "5.00"))
+
 
 def load_environment() -> None:
-    """Загружает ключи из корневого .env и настраивает FAL_KEY для fal SDK."""
+    """Перечитывает .env (идемпотентно — модуль уже загрузил его при импорте)
+    и настраивает FAL_KEY для fal SDK.
+
+    Оставлен для существующих вызывающих (app.main()): реального повторного
+    парсинга constants не делает — они уже прочитаны при импорте модуля выше,
+    — но FALAI_API_KEY → FAL_KEY переносится именно здесь, при явном вызове,
+    а не при импорте, чтобы не привязывать этот побочный эффект ко времени
+    импорта config.
+    """
     load_dotenv(REPO_ROOT / ".env")
     fal_key = os.getenv("FALAI_API_KEY")
     if fal_key and not os.getenv("FAL_KEY"):
