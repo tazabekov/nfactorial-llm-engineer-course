@@ -10,6 +10,7 @@ mkdir -p "${STAGING}"
 rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
       --exclude 'cache' --exclude 'output' --exclude 'assets-private' \
       --exclude '.env' --exclude '*.pt' --exclude '*.bin' --exclude '*.ckpt' \
+      --exclude 'assets/demo1.*' --exclude 'assets/demo2.*' \
       "${PROJECT_DIR}/" "${STAGING}/"
 
 cd "$(dirname "${STAGING}")"
